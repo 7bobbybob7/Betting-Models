@@ -1,0 +1,9 @@
+psycopg2-binary
+python-dotenv
+pandas
+numpy
+scikit-learn
+xgboost
+streamlit
+pybaseball
+requests
