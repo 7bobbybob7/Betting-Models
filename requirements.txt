@@ -9,3 +9,6 @@ pybaseball
 MLB-StatsAPI
 requests
 tqdm
+fastapi
+uvicorn
+matplotlib

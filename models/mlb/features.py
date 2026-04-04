@@ -325,6 +325,87 @@ def _empty_batting_features():
 
 
 # ---------------------------------------------------------------------------
+# Bullpen features
+# ---------------------------------------------------------------------------
+def load_bullpen():
+    """Load all reliever pitching game logs."""
+    return query("""
+        SELECT
+            pg.game_id, pg.player_id, pg.team_id,
+            pg.ip, pg.hits_allowed, pg.earned_runs, pg.bb, pg.so, pg.hr_allowed,
+            g.game_date, g.home_team_id, g.away_team_id
+        FROM mlb_pitching_game pg
+        JOIN games g ON pg.game_id = g.game_id
+        WHERE pg.is_starter = false AND pg.ip > 0
+        ORDER BY g.game_date, pg.game_id
+    """)
+
+
+def build_bullpen_features(bullpen_df):
+    """
+    Build rolling bullpen features per team.
+    Returns dict: (game_id, team_id) -> feature dict
+    """
+    print("  Building bullpen features...")
+    bullpen_df = bullpen_df.sort_values("game_date").copy()
+
+    # Convert IP to true innings
+    bullpen_df["ip_true"] = bullpen_df["ip"].apply(
+        lambda x: int(x) + (x % 1) * 10 / 3 if pd.notna(x) else 0
+    )
+
+    # Aggregate per team per game
+    team_game = bullpen_df.groupby(["game_id", "team_id", "game_date"]).agg(
+        bp_ip=("ip_true", "sum"),
+        bp_er=("earned_runs", "sum"),
+        bp_hits=("hits_allowed", "sum"),
+        bp_bb=("bb", "sum"),
+        bp_so=("so", "sum"),
+        bp_hr=("hr_allowed", "sum"),
+        bp_arms=("player_id", "nunique"),
+    ).reset_index()
+
+    features = {}
+
+    for tid, grp in tqdm(team_game.groupby("team_id"), desc="  Bullpens", leave=False):
+        grp = grp.sort_values("game_date").reset_index(drop=True)
+
+        for i in range(len(grp)):
+            row = grp.iloc[i]
+            game_id = int(row["game_id"])
+            game_date = row["game_date"]
+
+            # Rolling 7-day window (by date, not by games)
+            mask = (grp["game_date"] < game_date) & (grp["game_date"] >= game_date - pd.Timedelta(days=7))
+            window = grp[mask]
+
+            # Rolling 3-day fatigue
+            mask_3d = (grp["game_date"] < game_date) & (grp["game_date"] >= game_date - pd.Timedelta(days=3))
+            window_3d = grp[mask_3d]
+
+            feat = {}
+            if len(window) < 2:
+                feat = _empty_bullpen_features()
+            else:
+                ip = window["bp_ip"].sum()
+                feat["bp_era_7d"] = _rate(window["bp_er"].sum(), ip, 9)
+                feat["bp_whip_7d"] = _rate(window["bp_hits"].sum() + window["bp_bb"].sum(), ip, 1)
+                feat["bp_k9_7d"] = _rate(window["bp_so"].sum(), ip, 9)
+                feat["bp_ip_7d"] = round(ip, 1)
+                feat["bp_ip_3d"] = round(window_3d["bp_ip"].sum(), 1) if len(window_3d) > 0 else 0.0
+
+            features[(game_id, int(tid))] = feat
+
+    return features
+
+
+def _empty_bullpen_features():
+    return {k: None for k in [
+        "bp_era_7d", "bp_whip_7d", "bp_k9_7d", "bp_ip_7d", "bp_ip_3d",
+    ]}
+
+
+# ---------------------------------------------------------------------------
 # Park factors
 # ---------------------------------------------------------------------------
 def compute_park_factors(games_df):
@@ -357,8 +438,9 @@ def build_feature_matrix(start_year, end_year):
     games = load_games()
     pitching = load_pitching()
     batting = load_batting()
+    bullpen_raw = load_bullpen()
 
-    print(f"  Games: {len(games)}, Pitching: {len(pitching)}, Batting: {len(batting)}")
+    print(f"  Games: {len(games)}, Pitching: {len(pitching)}, Batting: {len(batting)}, Bullpen: {len(bullpen_raw)}")
 
     # Filter to requested years
     games = games[(games["season_year"] >= start_year) & (games["season_year"] <= end_year)]
@@ -367,7 +449,14 @@ def build_feature_matrix(start_year, end_year):
     # Build features
     pitcher_feats = build_pitcher_features(pitching)
     batting_feats = build_batting_features(batting)
+    bullpen_feats = build_bullpen_features(bullpen_raw)
     park_factors = compute_park_factors(games)
+
+    # Build ELO
+    from models.mlb.elo import MLBElo
+    elo = MLBElo()
+    elo.run(start_year=2015, end_year=end_year)
+    elo_data = elo.get_game_elos()
 
     # Assemble rows
     print("  Assembling feature matrix...")
@@ -420,6 +509,24 @@ def build_feature_matrix(start_year, end_year):
         for k, v in a_bat.items():
             row[f"away_{k}"] = v
 
+        # Bullpen features
+        h_bp = bullpen_feats.get((gid, home_tid), _empty_bullpen_features())
+        for k, v in h_bp.items():
+            row[f"home_{k}"] = v
+
+        a_bp = bullpen_feats.get((gid, away_tid), _empty_bullpen_features())
+        for k, v in a_bp.items():
+            row[f"away_{k}"] = v
+
+        # ELO features
+        game_elo = elo_data.get(gid, {})
+        row["home_elo"] = game_elo.get("home_elo")
+        row["away_elo"] = game_elo.get("away_elo")
+        row["home_elo_eff"] = game_elo.get("home_elo_eff")
+        row["away_elo_eff"] = game_elo.get("away_elo_eff")
+        row["elo_diff"] = game_elo.get("elo_diff")
+        row["elo_win_prob"] = game_elo.get("home_win_prob")
+
         # Contextual
         row["park_factor"] = park_factors.get(game["venue"], 1.0)
         row["weather_temp"] = game.get("weather_temp")
@@ -431,14 +538,17 @@ def build_feature_matrix(start_year, end_year):
 
     # Compute differentials (home - away)
     diff_cols = [
-        ("p_fip_5", True),     # lower FIP is better, so negate
+        ("p_fip_5", True),       # lower FIP is better, so invert
         ("p_kpct_5", False),
         ("p_bbpct_5", True),
         ("p_era_szn", True),
         ("b_woba_15", False),
         ("b_ops_15", False),
         ("b_rpg_15", False),
-        ("b_kpct_15", True),   # lower K% is better for batters
+        ("b_kpct_15", True),     # lower K% is better for batters
+        ("bp_era_7d", True),     # lower bullpen ERA is better
+        ("bp_whip_7d", True),
+        ("bp_ip_3d", True),      # more recent bullpen usage = worse (fatigued)
     ]
     for col, invert in diff_cols:
         h_col = f"home_{col}"
@@ -477,6 +587,8 @@ def main():
     print(f"  Home win rate: {df['home_win'].mean():.3f}")
     print(f"  Non-null pitcher features: {df['home_p_fip_5'].notna().sum()} / {len(df)}")
     print(f"  Non-null batting features: {df['home_b_woba_15'].notna().sum()} / {len(df)}")
+    print(f"  Non-null bullpen features: {df['home_bp_era_7d'].notna().sum()} / {len(df)}")
+    print(f"  Non-null ELO features: {df['elo_diff'].notna().sum()} / {len(df)}")
     print(f"\nSample feature stats:")
     feat_cols = [c for c in df.columns if c.startswith("diff_")]
     if feat_cols:
