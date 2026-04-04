@@ -6,3 +6,7 @@ __pycache__/
 *.db
 .DS_Store
 *.json
+data/
+CLAUDE.md
+SESSION_SUMMARY.md
+PRD.md

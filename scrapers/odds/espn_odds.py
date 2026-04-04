@@ -166,7 +166,7 @@ def parse_odds_item(item):
     if "Live" in provider_name:
         return []
 
-    sportsbook = provider_name.lower().replace(" ", "_").replace("(", "").replace(")", "")
+    sportsbook = provider_name.lower().replace(" ", "_").replace("(", "").replace(")", "")[:30]
 
     rows = []
 
