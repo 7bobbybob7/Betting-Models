@@ -133,15 +133,21 @@ def extract_moneyline_odds(game_data):
     # Format 2: odds is from the moneyline array in the Arnav-style format
     elif isinstance(odds, list):
         for entry in odds:
+            if entry is None:
+                continue
             book = entry.get("sportsbook", "unknown")
             current = entry.get("currentLine", {})
+            if current is None:
+                continue
             home_ml = current.get("homeOdds")
             away_ml = current.get("awayOdds")
             if home_ml is not None and away_ml is not None:
+                home_ml_f = max(min(float(home_ml), 99999), -99999)
+                away_ml_f = max(min(float(away_ml), 99999), -99999)
                 rows.append({
                     "sportsbook": str(book).lower().replace(" ", "_")[:30],
-                    "home_ml": float(home_ml),
-                    "away_ml": float(away_ml),
+                    "home_ml": home_ml_f,
+                    "away_ml": away_ml_f,
                 })
 
     return rows

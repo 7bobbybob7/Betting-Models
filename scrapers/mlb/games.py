@@ -158,9 +158,15 @@ def pull_season_games(sport_id, year):
             skipped += 1
             continue
 
-        # Only final games
+        # Accept final games and scheduled/upcoming games
         status = game.get("status", "")
-        if "Final" not in status and "Completed" not in status:
+        if "Final" in status or "Completed" in status:
+            game_status = "final"
+        elif "Scheduled" in status or "Pre-Game" in status or "Warmup" in status:
+            game_status = "scheduled"
+        elif "In Progress" in status or "Live" in status:
+            game_status = "in_progress"
+        else:
             continue
 
         # Skip spring training, all-star, etc.
@@ -190,9 +196,9 @@ def pull_season_games(sport_id, year):
             None,  # game_time
             home_team_id,
             away_team_id,
-            home_score,
-            away_score,
-            "final",
+            home_score if game_status == "final" else None,
+            away_score if game_status == "final" else None,
+            game_status,
             venue,
             is_postseason,
             False,  # is_neutral_site
