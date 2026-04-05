@@ -115,6 +115,7 @@ def generate_predictions(features_df, odds_data, target_date):
     model_files = {
         "mlb_logreg_v1": "models/mlb/saved/lr_core.pkl",
         "mlb_totals_v1": "models/mlb/saved/totals_model.pkl",
+        "mlb_k_v1": "models/mlb/saved/k_poisson.pkl",
     }
 
     for name, path in model_files.items():
@@ -124,6 +125,39 @@ def generate_predictions(features_df, odds_data, target_date):
     if not models:
         print("  No models found!")
         return
+
+    # Load Statcast features for K model if available
+    k_pitcher_feats = {}
+    k_team_feats = {}
+    if "mlb_k_v1" in models:
+        try:
+            from models.mlb.statcast_features import build_statcast_features
+            k_pitcher_feats, k_team_feats = build_statcast_features()
+        except Exception as e:
+            print(f"  Warning: Statcast features failed: {e}")
+
+    # Get starter mapping for K model
+    starter_map = {}
+    if "mlb_k_v1" in models:
+        from db.db import query as db_query
+        starters = db_query("""
+            SELECT g.game_id, g.home_team_id, g.away_team_id,
+                   hp.player_id as home_starter, ap.player_id as away_starter,
+                   hp.so as home_k_history, ap.so as away_k_history
+            FROM games g
+            LEFT JOIN mlb_pitching_game hp ON g.game_id = hp.game_id
+                AND hp.team_id = g.home_team_id AND hp.is_starter = true
+            LEFT JOIN mlb_pitching_game ap ON g.game_id = ap.game_id
+                AND ap.team_id = g.away_team_id AND ap.is_starter = true
+            WHERE g.sport_id = 2
+        """)
+        for _, r in starters.iterrows():
+            starter_map[int(r["game_id"])] = {
+                "home_starter": int(r["home_starter"]) if pd.notna(r["home_starter"]) else None,
+                "away_starter": int(r["away_starter"]) if pd.notna(r["away_starter"]) else None,
+                "home_team_id": int(r["home_team_id"]),
+                "away_team_id": int(r["away_team_id"]),
+            }
 
     predictions = []
 
@@ -155,7 +189,7 @@ def generate_predictions(features_df, odds_data, target_date):
                 if market_imp:
                     pred["ml_edge"] = round(float(prob) - market_imp, 4)
 
-        # Totals prediction
+        # Totals prediction (always generate, even without odds)
         if "mlb_totals_v1" in models:
             bundle = models["mlb_totals_v1"]
             avail = [c for c in bundle["features"] if c in features_df.columns]
@@ -165,7 +199,7 @@ def generate_predictions(features_df, odds_data, target_date):
             pred_total = bundle["model"].predict(X)[0]
             pred["pred_total"] = round(float(pred_total), 2)
 
-            # Compare with market total
+            # Compare with market total (if available)
             total_odds = game_odds.get("total", [])
             if total_odds:
                 market_total = total_odds[0].get("total_line")
@@ -188,11 +222,46 @@ def generate_predictions(features_df, odds_data, target_date):
                     if qualifies:
                         pred["totals_side"] = "OVER" if pred["total_edge"] > 0 else "UNDER"
 
+        # K model predictions (for both starters)
+        if "mlb_k_v1" in models and gid in starter_map:
+            bundle = models["mlb_k_v1"]
+            game_starters = starter_map[gid]
+
+            for side, starter_key, opp_tid_key in [
+                ("home", "home_starter", "away_team_id"),
+                ("away", "away_starter", "home_team_id"),
+            ]:
+                pid = game_starters[starter_key]
+                opp_tid = game_starters[opp_tid_key]
+                if pid is None:
+                    continue
+
+                # Build K features for this pitcher
+                sc = k_pitcher_feats.get((gid, pid), {})
+                tk = k_team_feats.get((gid, opp_tid), {})
+
+                # Also need rolling K features from box scores
+                k_feat = {}
+                k_feat.update(sc)
+                k_feat.update(tk)
+
+                # Get features the model expects
+                avail = bundle["features"]
+                feat_vals = {f: k_feat.get(f) for f in avail}
+                X = pd.DataFrame([feat_vals])
+                X = X.fillna(bundle["medians"])
+
+                if "scaler" in bundle:
+                    X = bundle["scaler"].transform(X)
+
+                pred_k = bundle["model"].predict(X)[0]
+                pred[f"{side}_pred_k"] = round(float(pred_k), 2)
+
         predictions.append(pred)
 
     # Display
-    print(f"\n  {'Home':<25s} {'Away':<25s} {'ML Prob':>8s} {'ML Edge':>8s} {'Pred Tot':>9s} {'Mkt Tot':>8s} {'T Edge':>7s} {'BET':>8s}")
-    print(f"  {'-'*105}")
+    print(f"\n  {'Home':<25s} {'Away':<25s} {'ML Prob':>8s} {'ML Edge':>8s} {'Pred Tot':>9s} {'Mkt Tot':>8s} {'T Edge':>7s} {'H K':>5s} {'A K':>5s} {'BET':>8s}")
+    print(f"  {'-'*120}")
 
     bets = []
     for p in predictions:
@@ -201,9 +270,11 @@ def generate_predictions(features_df, odds_data, target_date):
         pred_t = f"{p.get('pred_total', 0):.1f}" if "pred_total" in p else "   —"
         mkt_t = f"{p.get('market_total', 0):.1f}" if "market_total" in p else "   —"
         t_edge = f"{p.get('total_edge', 0):+.1f}" if "total_edge" in p else "   —"
+        h_k = f"{p.get('home_pred_k', 0):.1f}" if "home_pred_k" in p else "  —"
+        a_k = f"{p.get('away_pred_k', 0):.1f}" if "away_pred_k" in p else "  —"
         bet = p.get("totals_side", "—") if p.get("totals_bet") else "—"
 
-        print(f"  {p['home_team']:<25s} {p['away_team']:<25s} {ml_prob:>8s} {ml_edge:>8s} {pred_t:>9s} {mkt_t:>8s} {t_edge:>7s} {bet:>8s}")
+        print(f"  {p['home_team']:<25s} {p['away_team']:<25s} {ml_prob:>8s} {ml_edge:>8s} {pred_t:>9s} {mkt_t:>8s} {t_edge:>7s} {h_k:>5s} {a_k:>5s} {bet:>8s}")
 
         if p.get("totals_bet"):
             bets.append(p)
@@ -235,13 +306,26 @@ def log_predictions(predictions):
                 False, None, None, None, None,
             ))
 
-        # Log totals prediction
-        if "pred_total" in p and "market_total" in p:
-            edge = p.get("total_edge", 0)
+        # Log totals prediction (always, even without odds)
+        if "pred_total" in p:
             rows.append((
                 p["game_id"], "mlb_totals_v1_live", "total",
-                None, p["pred_total"], None,
+                None, p["pred_total"], p.get("total_edge"),
                 p.get("totals_bet", False), None, None, None, None,
+            ))
+
+        # Log K predictions (home and away starters)
+        if "home_pred_k" in p:
+            rows.append((
+                p["game_id"], "mlb_k_v1_live", "pitcher_k_home",
+                None, p["home_pred_k"], None,
+                False, None, None, None, None,
+            ))
+        if "away_pred_k" in p:
+            rows.append((
+                p["game_id"], "mlb_k_v1_live", "pitcher_k_away",
+                None, p["away_pred_k"], None,
+                False, None, None, None, None,
             ))
 
     if rows:

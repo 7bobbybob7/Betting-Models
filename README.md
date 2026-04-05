@@ -4,11 +4,11 @@ A predictive betting platform that generates fair-value probabilities across gam
 
 ## Results
 
-| Model | Market | Key Metric |
-|-------|--------|-----------|
-| Team-Level (LogReg) | Moneyline | +0.42% CLV, positive in 6/6 seasons |
-| Pitcher K (Poisson) | Player Props | 1.83 MAE, calibration within 2% |
-| **Totals** | **Over/Under** | **+9.0% ROI, 57.5% win rate (487 bets, 6 seasons)** |
+| Model | Market | Key Metric | Notes |
+|-------|--------|-----------|-------|
+| Team-Level (LogReg) | Moneyline | +0.42% CLV, positive 6/6 seasons | Real signal, unprofitable after vig |
+| Pitcher K (Poisson) | Player Props | 1.83 MAE, calibration within 2% | No prop lines yet for CLV |
+| **Totals** | **Over/Under** | **+5.2% ROI, 55.7% win (235 bets, true OOS)** | **p=0.20 — promising but unproven** |
 
 ## Architecture
 
@@ -49,16 +49,16 @@ SBR scraper ────┘          Totals model                Streamlit dashb
 ### Phase 3: Player-Level Game Model
 - Lineup-specific features replace team averages (per-player wOBA, K%, exit velo, xBA)
 - Batting order weights — top of order weighted higher
-- Totals model — **strongest signal found**: +9.0% ROI on conservative strategy
+- Totals model — strongest directional signal found
 
-### Totals Strategy (Validated)
+### Totals Strategy
 Conservative filters with causal mechanisms only:
 - Edge ≥ 1.5 runs vs market total
 - May through September (feature quality)
 - Regular season only
 - Hitter-friendly parks (park factor ≥ 1.0)
 
-Backtested across 6 seasons: 487 bets, 57.5% win rate, +9.0% ROI, 8.7% max drawdown, profitable 5/6 years.
+True out-of-sample (train 2016-2022, holdout 2023-2024): 235 bets, 55.7% win rate, +5.2% ROI, +2.1% probability CLV. p-value = 0.20 vs breakeven — directionally promising but not yet statistically significant. Live deployment is the real test.
 
 ## Stack
 
