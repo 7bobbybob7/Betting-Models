@@ -12,3 +12,5 @@ tqdm
 fastapi
 uvicorn
 matplotlib
+statsmodels
+nba_api
