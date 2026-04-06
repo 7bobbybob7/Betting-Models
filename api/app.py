@@ -130,17 +130,19 @@ def get_today(date: Optional[str] = None):
 def get_clv(model: Optional[str] = None, season: Optional[int] = None):
     sql = """
         SELECT p.model_name, s.year as season,
-               COUNT(*) as games,
-               AVG(p.edge) as mean_clv,
-               AVG(CASE WHEN p.edge > 0 THEN 1.0 ELSE 0.0 END) as clv_positive_pct,
-               AVG(CASE WHEN
-                   (p.predicted_prob > 0.5 AND p.outcome = 'win') OR
-                   (p.predicted_prob < 0.5 AND p.outcome = 'loss')
-                   THEN 1.0 ELSE 0.0 END) as accuracy
+               COUNT(*) as n_bets,
+               AVG(p.clv_model) as avg_clv_model,
+               AVG(p.clv_execution) as avg_clv_execution,
+               AVG(COALESCE(p.clv_model, 0) + COALESCE(p.clv_execution, 0)) as avg_clv_total,
+               SUM(CASE WHEN p.clv_model > 0 THEN 1 ELSE 0 END)::float
+                   / NULLIF(COUNT(p.clv_model), 0) as clv_model_positive_pct,
+               COUNT(p.clv_model) as n_with_model_clv,
+               COUNT(p.clv_execution) as n_with_exec_clv
         FROM predictions p
         JOIN games g ON p.game_id = g.game_id
         JOIN seasons s ON g.season_id = s.season_id
-        WHERE p.edge IS NOT NULL AND p.market = 'moneyline'
+        WHERE p.bet_placed = true AND p.market = 'total'
+          AND p.model_name LIKE '%%totals%%live'
     """
     params = []
     if model:
@@ -197,16 +199,27 @@ def get_calibration(model: str = "mlb_logreg_v1", season: Optional[int] = None, 
 # ---------------------------------------------------------------------------
 @app.get("/bankroll")
 def get_bankroll():
+    # Deduped bankroll: one bet per game at best odds
     df = query("""
+        WITH ranked AS (
+            SELECT *, ROW_NUMBER() OVER (
+                PARTITION BY game_id
+                ORDER BY COALESCE(bet_odds, 0) DESC
+            ) as rn
+            FROM predictions
+            WHERE bet_placed = true
+              AND model_name IN ('mlb_totals_reg_live', 'mlb_totals_clf_live', 'mlb_totals_v1_live')
+              AND market = 'total'
+        )
         SELECT
             COUNT(*) as total_bets,
             SUM(CASE WHEN outcome = 'win' THEN 1 ELSE 0 END) as wins,
             SUM(CASE WHEN outcome = 'loss' THEN 1 ELSE 0 END) as losses,
             SUM(CASE WHEN outcome IS NULL THEN 1 ELSE 0 END) as pending,
             COALESCE(SUM(pnl), 0) as total_pnl,
-            COALESCE(SUM(bet_amount), 0) as total_wagered
-        FROM predictions
-        WHERE bet_placed = true AND model_name LIKE '%%_live'
+            COALESCE(SUM(bet_amount), 0) as total_wagered,
+            AVG(CASE WHEN edge IS NOT NULL THEN edge END) as avg_clv
+        FROM ranked WHERE rn = 1
     """)
     r = df.iloc[0]
     total = int(r["total_bets"] or 0)
@@ -215,6 +228,20 @@ def get_bankroll():
     pending = int(r["pending"] or 0)
     pnl = float(r["total_pnl"] or 0)
     wagered = float(r["total_wagered"] or 0)
+
+    # Per-model breakdown
+    models_df = query("""
+        SELECT model_name,
+            COUNT(*) as bets,
+            SUM(CASE WHEN outcome = 'win' THEN 1 ELSE 0 END) as wins,
+            SUM(CASE WHEN outcome = 'loss' THEN 1 ELSE 0 END) as losses,
+            COALESCE(SUM(pnl), 0) as pnl,
+            COALESCE(SUM(bet_amount), 0) as wagered
+        FROM predictions
+        WHERE bet_placed = true AND model_name LIKE '%%totals%%live'
+        GROUP BY model_name
+    """)
+
     return {
         "starting_bankroll": 10000,
         "current_bankroll": round(10000 + pnl, 2),
@@ -226,6 +253,8 @@ def get_bankroll():
         "wagered": round(wagered, 2),
         "roi": round(pnl / wagered * 100, 2) if wagered > 0 else 0,
         "win_rate": round(wins / (wins + losses), 4) if (wins + losses) > 0 else 0,
+        "avg_clv": round(float(r["avg_clv"] or 0), 4),
+        "per_model": models_df.to_dict(orient="records") if len(models_df) > 0 else [],
     }
 
 

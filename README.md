@@ -1,6 +1,6 @@
 # Multi-Sport Betting Platform
 
-A predictive betting platform that generates fair-value probabilities across game outcomes, totals, and player prop markets. Built on 7.6M+ Statcast pitches, 25K+ MLB games, and 621K+ odds records. Tracks closing line value (CLV) as the primary signal metric.
+A predictive betting platform that generates fair-value probabilities across game outcomes, totals, and player prop markets. Built on 7.6M+ Statcast pitches, 25K+ MLB games, and 650K+ odds records across 27+ sportsbooks. Tracks decomposed CLV (closing line value) to separate model skill from line shopping value.
 
 ## Results
 
@@ -8,18 +8,37 @@ A predictive betting platform that generates fair-value probabilities across gam
 |-------|--------|-----------|-------|
 | Team-Level (LogReg) | Moneyline | +0.42% CLV, positive 6/6 seasons | Real signal, unprofitable after vig |
 | Pitcher K (Poisson) | Player Props | 1.83 MAE, calibration within 2% | No prop lines yet for CLV |
-| **Totals** | **Over/Under** | **+5.2% ROI, 55.7% win (235 bets, true OOS)** | **p=0.20 — promising but unproven** |
+| **Totals (Regression)** | **Over/Under** | **51.3% win, +0.3% ROI w/ line shopping** | **Live testing 2026** |
+| **Totals (Classifier)** | **Over/Under** | **51.1% win, +1.7% ROI w/ line shopping** | **Comparison model 2026** |
+
+**Critical finding:** Without line shopping across 6+ sportsbooks, both strategies lose money. The model provides ~51.3% directional accuracy; profitability depends entirely on getting best-available odds.
+
+## How It Works
+
+### 2-Step Betting Framework
+
+1. **Informational edge:** Multiplicative de-vig on median book odds gives the market consensus P(over). Model generates its own P(over). The gap is the info edge.
+2. **Execution edge:** If info edge exceeds threshold, line shop across all books for the best price. Only bet if model probability beats the breakeven at the best available odds.
+
+### CLV Decomposition
+
+Every bet is decomposed into two sources of value:
+- **Model CLV** — Did the market consensus move toward our position? (informational edge)
+- **Execution CLV** — Was our bet book softer than the consensus? (line shopping value)
+
+This answers the key question: is profit coming from the model being right, or from catching soft lines?
 
 ## Architecture
 
 ```
 DATA LAYER                 MODEL LAYER                 OPERATIONS
-──────────                 ───────────                 ──────────
-MLB Stats API ──┐          ELO (starter-adjusted)      GitHub Actions cron
-pybaseball ─────┤          LogReg + XGBoost (ML)       Daily prediction pipeline
-Statcast ───────┤──► PG    Poisson (pitcher K's)       SBR odds scraper
-ESPN API ───────┤          Lineup-specific features    FastAPI backend
-SBR scraper ────┘          Totals model                Streamlit dashboard
+----------                 -----------                 ----------
+MLB Stats API ---+          ELO (starter-adjusted)      GitHub Actions (3 daily crons)
+pybaseball ------+          LogReg (moneyline)          Daily prediction pipeline
+Statcast --------+---> PG   LinearReg (totals)          SBR odds scraper (6 books)
+ESPN API --------+          LogReg L1 (classifier)      FastAPI backend (8 endpoints)
+SBR scraper -----+          Poisson (pitcher K)         Streamlit dashboard (6 tabs)
+nba_api ---------+          WNBA ELO + features         Backfill outcomes + CLV
 ```
 
 ## Data
@@ -30,67 +49,100 @@ SBR scraper ────┘          Totals model                Streamlit dashb
 | Statcast Pitches | 7.6M+ | Pitch-level data (velo, spin, movement, outcomes) |
 | Batting Stats | 600K+ | Per-player per-game batting lines |
 | Pitching Stats | 221K+ | Per-player per-game pitching lines |
-| Odds | 621K+ | Multi-book closing lines (2015-2025, 27+ sportsbooks) |
+| Odds | 650K+ | Multi-book closing lines (2015-2026, 27+ sportsbooks) |
+| WNBA Games | 2,601 | 2015-2024 via ESPN + nba_api |
+| Predictions | 14K+ | All model predictions with outcomes, P&L, decomposed CLV |
 | CBB Games | 53K+ | College basketball (migrated from prior project) |
 
 ## Models
 
-### Phase 1: Team-Level Baseline
-- Custom MLB ELO with starter adjustments (pitcher quality shifts team ELO per game)
-- Bullpen features (7-day rolling ERA/WHIP, 3-day fatigue)
-- 113 features: pitcher, batting, bullpen, ELO, park factor, weather
-- Positive CLV in 6 consecutive test seasons (2019-2024)
+### MLB Moneyline (Phase 1-3)
+- Custom ELO with starter adjustments (pitcher quality shifts team ELO per game, K=6)
+- 113 features: pitcher, batting, bullpen, ELO, park factor, weather, lineup-specific
+- LogReg with L1 regularization outperforms XGBoost at high volume
+- +0.42% CLV across 6 seasons, but unprofitable after vig at any threshold
 
-### Phase 2: Player Prop Models
-- **Pitcher K model** (Poisson regression) — Statcast features: whiff rate, chase rate, pitch mix, velocity
-- Pitcher IP model — coupled with K model for projected innings
-- Hitter prop models — hits, total bases, HR using Statcast batted ball data
+### MLB Totals — Dual Model Live Test (Phase 4)
+Two approaches running in parallel for the 2026 season:
 
-### Phase 3: Player-Level Game Model
-- Lineup-specific features replace team averages (per-player wOBA, K%, exit velo, xBA)
-- Batting order weights — top of order weighted higher
-- Totals model — strongest directional signal found
+**Regression (primary):** LinearRegression predicts total runs, converts to P(over) via normal CDF. Threshold: >=1% info edge + EV gate. ~1,500 bets/year, 51.3% win rate.
 
-### Totals Strategy
-Conservative filters with causal mechanisms only:
-- Edge ≥ 1.5 runs vs market total
-- May through September (feature quality)
-- Regular season only
-- Hitter-friendly parks (park factor ≥ 1.0)
+**Classifier (comparison):** LogReg L1 directly classifies over/under using game features + market line. Threshold: >=3% info edge + EV gate. ~700 bets/year, 51.1% win rate but higher ROI via odds selection.
 
-True out-of-sample (train 2016-2022, holdout 2023-2024): 235 bets, 55.7% win rate, +5.2% ROI, +2.1% probability CLV. p-value = 0.20 vs breakeven — directionally promising but not yet statistically significant. Live deployment is the real test.
+Both use: multiplicative de-vig on median book, line shopping across 6+ books, $100 flat sizing, decomposed CLV tracking.
+
+### Pitcher K Props (Phase 2)
+- Poisson regression with Statcast features (whiff rate, chase rate, pitch mix, velocity)
+- 1.83 MAE, excellent calibration across all K ranges
+- No prop line data yet for CLV measurement
+
+### WNBA (Phase 5)
+- 2,601 games loaded (2015-2024), ELO trained (K=22, home_advantage=55)
+- Cross-validated totals: -2.1% ROI — thin-market thesis did not hold
+- Ready to wire into pipeline for May 2026 season start
+
+## Live Pipeline
+
+Runs automatically via GitHub Actions at three times daily:
+
+| Run | Time (ET) | Purpose |
+|-----|-----------|---------|
+| Backfill | 6:00 AM | Outcomes, edges, P&L, decomposed CLV for completed games |
+| Day games | 11:30 AM | Predictions for afternoon slate |
+| Night games | 6:30 PM | Predictions for evening slate |
+
+Pipeline steps:
+1. Pull new game results and box scores
+2. Scrape today's odds from SportsBookReview (6 books: bet365, DraftKings, FanDuel, BetMGM, Caesars, Fanatics)
+3. Build features and generate predictions (regression + classifier)
+4. De-vig median book, compute info edge, line shop for best price
+5. Flag bets meeting threshold criteria, log with bet_book and bet_odds
+6. Backfill: compute Model CLV + Execution CLV for resolved bets
+
+### Bankroll
+- $10,000 starting bankroll, $100 flat per flagged bet
+- One bet per game (deduped when both models flag the same game)
+- Per-model tracking for independent ROI/CLV comparison
+- Evaluation: October 2026 after regular season ends
 
 ## Stack
 
 - **Database:** PostgreSQL (Supabase)
 - **Language:** Python 3.12
-- **ML:** scikit-learn, XGBoost, statsmodels
-- **Data:** MLB Stats API, pybaseball (Statcast), ESPN API, SportsBookReview
-- **API:** FastAPI (7 endpoints)
+- **ML:** scikit-learn, XGBoost, statsmodels, scipy
+- **Data:** MLB Stats API, pybaseball (Statcast), ESPN API, nba_api, SportsBookReview
+- **API:** FastAPI (8 endpoints)
 - **Dashboard:** Streamlit (6 tabs)
-- **Automation:** GitHub Actions (daily cron)
+- **Automation:** GitHub Actions (3 daily cron jobs)
 
 ## Project Structure
 
 ```
-db/                  Schema and database connection (SimpleConnectionPool)
+db/                  Schema, migrations, and database connection (SimpleConnectionPool)
 scrapers/
   mlb/               Games, box scores, Statcast scrapers
-  odds/              ESPN historical, Arnav dataset loader, SBR daily scraper
+  wnba/              ESPN + nba_api scrapers
+  odds/              ESPN historical, Arnav dataset, SBR daily scraper
 models/
-  mlb/               Feature engineering, ELO, training, evaluation
+  mlb/
     features.py      113-column feature pipeline
-    elo.py           Starter-adjusted ELO system
+    elo.py           Starter-adjusted ELO system (K=6)
     train.py         LogReg + XGBoost training
+    totals_model.py  Run totals regression
+    train_totals_classifier.py  Over/under classifier
     k_model.py       Pitcher K Poisson model
     hitter_model.py  Hitter prop models
-    totals_model.py  Run totals prediction
     lineup_features.py  Per-player lineup aggregation
     statcast_features.py  Pitch-level feature engineering
-api/                 FastAPI backend
-dashboard/           Streamlit frontend
-scripts/             Daily pipeline, data refresh, CBB migration
-.github/workflows/   GitHub Actions daily cron
+    threshold_backtest.py  Dual-approach threshold comparison
+  wnba/              ELO, features, training
+api/                 FastAPI backend (games, predictions, CLV, bankroll, calibration, health)
+dashboard/           Streamlit frontend (today, performance, P&L, predictions, calibration, health)
+scripts/
+  daily_pipeline.py  Main pipeline: scrape, predict, flag, log
+  backfill_outcomes.py  Outcomes, P&L, decomposed CLV
+  daily_refresh.py   Data refresh utilities
+.github/workflows/   GitHub Actions (3 daily cron runs)
 ```
 
 ## Setup
@@ -105,6 +157,7 @@ scripts/             Daily pipeline, data refresh, CBB migration
    python -m scrapers.odds.espn_odds --sport mlb --start 2015 --end 2024
    python -m models.mlb.features --start 2016 --end 2025
    python -m models.mlb.train --save-models
+   python -m models.mlb.train_totals_classifier
    ```
 6. Run the daily pipeline:
    ```bash
@@ -116,18 +169,9 @@ scripts/             Daily pipeline, data refresh, CBB migration
    streamlit run dashboard/app.py
    ```
 
-## Daily Pipeline
-
-Runs automatically via GitHub Actions at 6:30 PM ET:
-1. Pull new game results and box scores
-2. Scrape today's odds from SportsBookReview
-3. Build features and generate predictions
-4. Flag totals bets meeting strategy criteria
-5. Log everything to the database
-
 ## Sports Roadmap
 
-- **MLB** — Live (Phases 1-4 complete)
-- **WNBA** — Next (season starts May 2026, schema ready)
+- **MLB** — Live (dual model test, decomposed CLV tracking)
+- **WNBA** — Next (season starts May 2026, data + models ready)
 - **CBB** — Data migrated, model from prior project
 - **NHL / NFL** — Schema stubbed, build when seasons approach

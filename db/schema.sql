@@ -166,9 +166,12 @@ CREATE TABLE predictions (
     edge            DECIMAL(5,4),               -- predicted_prob - closing_implied
     bet_placed      BOOLEAN DEFAULT FALSE,
     bet_amount      DECIMAL(8,2),
-    bet_odds        DECIMAL(8,3),               -- odds at time of bet
+    bet_odds        DECIMAL(8,3),               -- decimal odds at time of bet
+    bet_book        VARCHAR(30),                -- sportsbook with best odds
     outcome         VARCHAR(10),                -- 'win', 'loss', 'push', NULL if pending
     pnl             DECIMAL(10,2),
+    clv_model       DECIMAL(8,6),               -- model CLV: close_median_implied - our_implied
+    clv_execution   DECIMAL(8,6),               -- execution CLV: close_book_implied - close_median_implied
     created_at      TIMESTAMPTZ DEFAULT NOW(),
     UNIQUE(game_id, model_name, market)
 );

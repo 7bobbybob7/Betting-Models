@@ -216,14 +216,26 @@ with tab3:
 
     bankroll_data = api_get("/bankroll")
     if not bankroll_data:
+        # Deduped bankroll: one bet per game at best odds
         br = db_query("""
+            WITH ranked AS (
+                SELECT *, ROW_NUMBER() OVER (
+                    PARTITION BY game_id
+                    ORDER BY COALESCE(bet_odds, 0) DESC
+                ) as rn
+                FROM predictions
+                WHERE bet_placed = true
+                  AND model_name IN ('mlb_totals_reg_live', 'mlb_totals_clf_live', 'mlb_totals_v1_live')
+                  AND market = 'total'
+            )
             SELECT COUNT(*) as total_bets,
                    SUM(CASE WHEN outcome = 'win' THEN 1 ELSE 0 END) as wins,
                    SUM(CASE WHEN outcome = 'loss' THEN 1 ELSE 0 END) as losses,
                    SUM(CASE WHEN outcome IS NULL THEN 1 ELSE 0 END) as pending,
                    COALESCE(SUM(pnl), 0) as total_pnl,
-                   COALESCE(SUM(bet_amount), 0) as total_wagered
-            FROM predictions WHERE bet_placed = true AND model_name LIKE '%%_live'
+                   COALESCE(SUM(bet_amount), 0) as total_wagered,
+                   AVG(CASE WHEN edge IS NOT NULL THEN edge END) as avg_clv
+            FROM ranked WHERE rn = 1
         """)
         if len(br) > 0:
             r = br.iloc[0]
@@ -237,6 +249,7 @@ with tab3:
                 "wagered": round(float(r["total_wagered"] or 0), 2),
                 "roi": round(float(r["total_pnl"] or 0) / max(float(r["total_wagered"] or 1), 1) * 100, 2),
                 "win_rate": round(int(r["wins"] or 0) / max(int(r["wins"] or 0) + int(r["losses"] or 0), 1), 4),
+                "avg_clv": round(float(r.get("avg_clv") or 0), 4),
             }
     if bankroll_data:
         col1, col2, col3, col4 = st.columns(4)
@@ -254,6 +267,41 @@ with tab3:
             st.metric("Win Rate",
                        f"{bankroll_data['win_rate']:.1%}",
                        f"{bankroll_data['pending']} pending")
+
+        # Decomposed CLV
+        clv_data = api_get("/clv")
+        if not clv_data:
+            clv_data = db_query("""
+                SELECT model_name,
+                    AVG(clv_model) as avg_clv_model,
+                    AVG(clv_execution) as avg_clv_execution,
+                    COUNT(clv_model) as n_bets
+                FROM predictions
+                WHERE bet_placed = true AND market = 'total'
+                  AND model_name LIKE '%%totals%%live' AND clv_model IS NOT NULL
+                GROUP BY model_name
+            """)
+            if len(clv_data) > 0:
+                clv_data = clv_data.to_dict(orient="records")
+            else:
+                clv_data = []
+
+        if clv_data:
+            st.subheader("CLV Decomposition")
+            clv_cols = st.columns(len(clv_data))
+            for i, row in enumerate(clv_data):
+                model = row.get("model_name", "unknown")
+                m_clv = float(row.get("avg_clv_model") or 0)
+                e_clv = float(row.get("avg_clv_execution") or 0)
+                n = int(row.get("n_bets") or row.get("n_with_model_clv") or 0)
+                with clv_cols[i]:
+                    short_name = model.replace("mlb_totals_", "").replace("_live", "")
+                    st.markdown(f"**{short_name}** ({n} bets)")
+                    st.metric("Model CLV", f"{m_clv:+.2%}",
+                              "Info edge" if m_clv > 0 else "No info edge")
+                    st.metric("Execution CLV", f"{e_clv:+.2%}",
+                              "Line shopping value")
+                    st.metric("Total CLV", f"{m_clv + e_clv:+.2%}")
 
     st.subheader("Backtested Strategy (Reference)")
     st.markdown("""

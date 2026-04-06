@@ -118,6 +118,7 @@ def generate_predictions(features_df, odds_data, target_date):
     model_files = {
         "mlb_logreg_v1": "models/mlb/saved/lr_core.pkl",
         "mlb_totals_v1": "models/mlb/saved/totals_model.pkl",
+        "mlb_totals_clf": "models/mlb/saved/totals_classifier.pkl",
         "mlb_k_v1": "models/mlb/saved/k_poisson.pkl",
     }
 
@@ -192,7 +193,41 @@ def generate_predictions(features_df, odds_data, target_date):
                 if market_imp:
                     pred["ml_edge"] = round(float(prob) - market_imp, 4)
 
-        # Totals prediction (always generate, even without odds)
+        # Totals prediction — run both regression and classifier
+        # Both use the same 2-step framework:
+        #   Step 1: info_edge = model_p - devig_market_p (median book)
+        #   Step 2: bet if info_edge >= threshold AND model_p > breakeven at best odds
+
+        # Shared: collect market odds once
+        total_odds = game_odds.get("total", [])
+        market_total = None
+        over_odds_list = []
+        under_odds_list = []
+        if total_odds:
+            market_total = total_odds[0].get("total_line")
+            for t in total_odds:
+                ov = t.get("over_odds")
+                un = t.get("under_odds")
+                if ov is not None:
+                    over_odds_list.append(ov)
+                if un is not None:
+                    under_odds_list.append(un)
+
+        # De-vig once (shared by both models)
+        devig_over = devig_under = None
+        def _implied(am):
+            return 100 / (am + 100) if am >= 0 else abs(am) / (abs(am) + 100)
+
+        if market_total and over_odds_list and under_odds_list:
+            med_over = np.median(over_odds_list)
+            med_under = np.median(under_odds_list)
+            raw_over_imp = _implied(med_over)
+            raw_under_imp = _implied(med_under)
+            total_imp = raw_over_imp + raw_under_imp
+            devig_over = raw_over_imp / total_imp
+            devig_under = raw_under_imp / total_imp
+
+        # --- REGRESSION MODEL (mlb_totals_v1) ---
         if "mlb_totals_v1" in models:
             bundle = models["mlb_totals_v1"]
             avail = [c for c in bundle["features"] if c in features_df.columns]
@@ -202,63 +237,118 @@ def generate_predictions(features_df, odds_data, target_date):
             pred_total = bundle["model"].predict(X)[0]
             pred["pred_total"] = round(float(pred_total), 2)
 
-            # Compare with market total and find best odds (line shopping)
-            total_odds = game_odds.get("total", [])
-            if total_odds:
-                market_total = total_odds[0].get("total_line")
-                if market_total:
-                    pred["market_total"] = market_total
-                    pred["total_edge"] = round(float(pred_total) - market_total, 2)
+            if market_total:
+                pred["market_total"] = market_total
+                pred["total_edge"] = round(float(pred_total) - market_total, 2)
 
-                    # Line shopping: find best available odds for the side we'd bet
-                    bet_over = pred["total_edge"] > 0
+            if devig_over is not None:
+                from scipy.stats import norm
+                reg_p_over = 1 - norm.cdf(market_total, loc=pred_total, scale=4.5)
+                reg_p_under = 1 - reg_p_over
 
-                    if bet_over:
-                        # Find best over odds across all books
-                        best_odds = -110
-                        best_book = "unknown"
-                        for t in total_odds:
-                            ov = t.get("over_odds", -110)
-                            if ov is not None and ov > best_odds:
-                                best_odds = ov
-                                best_book = t.get("sportsbook", "unknown")
-                        pred["best_odds"] = best_odds
-                        pred["best_book"] = best_book
-                    else:
-                        # Find best under odds across all books
-                        best_odds = -110
-                        best_book = "unknown"
-                        for t in total_odds:
-                            un = t.get("under_odds", -110)
-                            if un is not None and un > best_odds:
-                                best_odds = un
-                                best_book = t.get("sportsbook", "unknown")
-                        pred["best_odds"] = best_odds
-                        pred["best_book"] = best_book
+                reg_over_edge = reg_p_over - devig_over
+                reg_under_edge = reg_p_under - devig_under
 
-                    # Compute breakeven at best available odds
-                    if best_odds >= 0:
-                        breakeven = 100 / (best_odds + 100)
-                    else:
-                        breakeven = abs(best_odds) / (abs(best_odds) + 100)
+                if reg_over_edge > reg_under_edge:
+                    reg_side = "over"
+                    reg_info_edge = reg_over_edge
+                    reg_win_prob = reg_p_over
+                else:
+                    reg_side = "under"
+                    reg_info_edge = reg_under_edge
+                    reg_win_prob = reg_p_under
 
-                    # Use classifier approach: compute model P(over) vs market implied
-                    from scipy.stats import norm
-                    model_p_over = 1 - norm.cdf(market_total, loc=pred_total, scale=3.4)
-                    market_p_over = 0.5  # approximate de-vigged
-                    prob_edge = abs(model_p_over - market_p_over)
+                if reg_side == "over":
+                    reg_best = max(over_odds_list)
+                    reg_book = "unknown"
+                    for t in total_odds:
+                        if t.get("over_odds") == reg_best:
+                            reg_book = t.get("sportsbook", "unknown")
+                            break
+                else:
+                    reg_best = max(under_odds_list)
+                    reg_book = "unknown"
+                    for t in total_odds:
+                        if t.get("under_odds") == reg_best:
+                            reg_book = t.get("sportsbook", "unknown")
+                            break
 
-                    # Bet if: model's win probability > breakeven at best available odds
-                    model_win_prob = model_p_over if bet_over else (1 - model_p_over)
-                    is_positive_ev = model_win_prob > breakeven
+                reg_breakeven = _implied(reg_best)
+                reg_ev = reg_win_prob - reg_breakeven
 
-                    pred["model_win_prob"] = round(float(model_win_prob), 4)
-                    pred["breakeven"] = round(float(breakeven), 4)
-                    pred["prob_edge"] = round(float(prob_edge), 4)
+                pred["best_odds"] = reg_best
+                pred["best_book"] = reg_book
+                pred["model_win_prob"] = round(float(reg_win_prob), 4)
+                pred["breakeven"] = round(float(reg_breakeven), 4)
+                pred["info_edge"] = round(float(reg_info_edge), 4)
+                pred["devig_implied"] = round(float(devig_over if reg_side == "over" else devig_under), 4)
 
-                    pred["totals_bet"] = is_positive_ev and prob_edge >= 0.01
-                    if pred["totals_bet"]:
-                        pred["totals_side"] = "OVER" if bet_over else "UNDER"
+                REG_THRESHOLD = 0.01
+                pred["totals_bet"] = reg_info_edge >= REG_THRESHOLD and reg_ev > 0
+                if pred["totals_bet"]:
+                    pred["totals_side"] = "OVER" if reg_side == "over" else "UNDER"
+
+        # --- CLASSIFIER MODEL (mlb_totals_clf) ---
+        if "mlb_totals_clf" in models and market_total and devig_over is not None:
+            clf_bundle = models["mlb_totals_clf"]
+            clf_avail = [c for c in clf_bundle["features"] if c in features_df.columns or c in ("market_line", "rpg_vs_line")]
+
+            # Build classifier features (needs market_line and rpg_vs_line)
+            clf_feat = {}
+            for c in clf_avail:
+                if c == "market_line":
+                    clf_feat[c] = market_total
+                elif c == "rpg_vs_line":
+                    home_rpg = game.get("home_b_rpg_15", 0) or 0
+                    away_rpg = game.get("away_b_rpg_15", 0) or 0
+                    clf_feat[c] = home_rpg + away_rpg - market_total
+                else:
+                    clf_feat[c] = game.get(c)
+            X_clf = pd.DataFrame([clf_feat])
+            X_clf = X_clf[clf_bundle["features"]].fillna(clf_bundle["medians"])
+            X_clf_s = clf_bundle["scaler"].transform(X_clf)
+
+            clf_p_over = clf_bundle["model"].predict_proba(X_clf_s)[0][1]
+            clf_p_under = 1 - clf_p_over
+
+            clf_over_edge = clf_p_over - devig_over
+            clf_under_edge = clf_p_under - devig_under
+
+            if clf_over_edge > clf_under_edge:
+                clf_side = "over"
+                clf_info_edge = clf_over_edge
+                clf_win_prob = clf_p_over
+            else:
+                clf_side = "under"
+                clf_info_edge = clf_under_edge
+                clf_win_prob = clf_p_under
+
+            if clf_side == "over":
+                clf_best = max(over_odds_list)
+                clf_book = "unknown"
+                for t in total_odds:
+                    if t.get("over_odds") == clf_best:
+                        clf_book = t.get("sportsbook", "unknown")
+                        break
+            else:
+                clf_best = max(under_odds_list)
+                clf_book = "unknown"
+                for t in total_odds:
+                    if t.get("under_odds") == clf_best:
+                        clf_book = t.get("sportsbook", "unknown")
+                        break
+
+            clf_breakeven = _implied(clf_best)
+            clf_ev = clf_win_prob - clf_breakeven
+
+            CLF_THRESHOLD = 0.03
+            pred["clf_info_edge"] = round(float(clf_info_edge), 4)
+            pred["clf_win_prob"] = round(float(clf_win_prob), 4)
+            pred["clf_best_odds"] = clf_best
+            pred["clf_best_book"] = clf_book
+            pred["clf_bet"] = clf_info_edge >= CLF_THRESHOLD and clf_ev > 0
+            if pred["clf_bet"]:
+                pred["clf_side"] = "OVER" if clf_side == "over" else "UNDER"
 
         # K model predictions (for both starters)
         if "mlb_k_v1" in models and gid in starter_map:
@@ -298,37 +388,48 @@ def generate_predictions(features_df, odds_data, target_date):
         predictions.append(pred)
 
     # Display
-    print(f"\n  {'Home':<22s} {'Away':<22s} {'Pred':>5s} {'Mkt':>5s} {'Edge':>5s} {'Win%':>5s} {'Best':>6s} {'Book':<12s} {'BET':>6s}")
-    print(f"  {'-'*95}")
+    print(f"\n  {'Home':<22s} {'Away':<22s} {'Pred':>5s} {'Mkt':>5s} {'Reg%':>6s} {'Clf%':>6s} {'Best':>6s} {'Book':<10s} {'REG':>5s} {'CLF':>5s}")
+    print(f"  {'-'*110}")
 
-    bets = []
+    reg_bets = []
+    clf_bets = []
     for p in predictions:
         pred_t = f"{p.get('pred_total', 0):.1f}" if "pred_total" in p else "  —"
         mkt_t = f"{p.get('market_total', 0):.1f}" if "market_total" in p else "  —"
-        t_edge = f"{p.get('total_edge', 0):+.1f}" if "total_edge" in p else "  —"
-        win_p = f"{p.get('model_win_prob', 0):.0%}" if "model_win_prob" in p else "  —"
+        reg_e = f"{p.get('info_edge', 0):+.1%}" if "info_edge" in p else "   —"
+        clf_e = f"{p.get('clf_info_edge', 0):+.1%}" if "clf_info_edge" in p else "   —"
         best_o = f"{p.get('best_odds', -110):+.0f}" if "best_odds" in p else "  —"
-        book = p.get("best_book", "")[:12] if "best_book" in p else ""
-        bet = p.get("totals_side", "—") if p.get("totals_bet") else "—"
+        book = p.get("best_book", "")[:10] if "best_book" in p else ""
+        reg_bet = p.get("totals_side", "—") if p.get("totals_bet") else "—"
+        clf_bet = p.get("clf_side", "—") if p.get("clf_bet") else "—"
 
-        print(f"  {p['home_team']:<22s} {p['away_team']:<22s} {pred_t:>5s} {mkt_t:>5s} {t_edge:>5s} {win_p:>5s} {best_o:>6s} {book:<12s} {bet:>6s}")
+        print(f"  {p['home_team']:<22s} {p['away_team']:<22s} {pred_t:>5s} {mkt_t:>5s} {reg_e:>6s} {clf_e:>6s} {best_o:>6s} {book:<10s} {reg_bet:>5s} {clf_bet:>5s}")
 
         if p.get("totals_bet"):
-            bets.append(p)
+            reg_bets.append(p)
+        if p.get("clf_bet"):
+            clf_bets.append(p)
 
-    if bets:
-        print(f"\n  ACTIONABLE BETS ({len(bets)}):")
-        for b in bets:
+    if reg_bets or clf_bets:
+        print(f"\n  REGRESSION BETS ({len(reg_bets)}) — ≥1% info_edge + EV gate:")
+        for b in reg_bets:
             side = b.get('totals_side', '?')
             total = b.get('market_total', '?')
             odds = b.get('best_odds', -110)
             book = b.get('best_book', '?')
-            win_p = b.get('model_win_prob', 0)
-            be = b.get('breakeven', 0.524)
-            edge_pct = (win_p - be) * 100
+            info = b.get('info_edge', 0)
             print(f"    {side} {total} at {odds:+.0f} ({book}) — "
-                  f"{b['away_team']} @ {b['home_team']} "
-                  f"(win prob: {win_p:.1%}, breakeven: {be:.1%}, edge: {edge_pct:+.1f}%)")
+                  f"{b['away_team']} @ {b['home_team']} (info edge: {info:+.1%})")
+
+        print(f"\n  CLASSIFIER BETS ({len(clf_bets)}) — ≥3% info_edge + EV gate:")
+        for b in clf_bets:
+            side = b.get('clf_side', '?')
+            total = b.get('market_total', '?')
+            odds = b.get('clf_best_odds', -110)
+            book = b.get('clf_best_book', '?')
+            info = b.get('clf_info_edge', 0)
+            print(f"    {side} {total} at {odds:+.0f} ({book}) — "
+                  f"{b['away_team']} @ {b['home_team']} (info edge: {info:+.1%})")
     else:
         print(f"\n  No +EV bets today")
 
@@ -347,41 +448,70 @@ def log_predictions(predictions):
     new_rows = []
     updates = []
 
+    def _to_decimal(american):
+        if american >= 0:
+            return round(1 + american / 100, 3)
+        return round(1 + 100 / abs(american), 3)
+
     for p in predictions:
         # Moneyline prediction
         if "ml_prob" in p:
             new_rows.append((
                 p["game_id"], "mlb_logreg_v1_live", "moneyline",
                 p["ml_prob"], None, p.get("ml_edge"),
-                False, None, None, None, None,
+                False, None, None, None, None, None,
             ))
 
-        # Totals prediction
+        # Regression totals prediction
         if "pred_total" in p:
             is_bet = p.get("totals_bet", False)
-            edge = p.get("total_edge")
+            info_edge = p.get("info_edge")
+            best_odds = p.get("best_odds")
+
+            bet_odds_decimal = _to_decimal(best_odds) if is_bet and best_odds is not None else None
+            bet_book = p.get("best_book") if is_bet else None
+
             new_rows.append((
-                p["game_id"], "mlb_totals_v1_live", "total",
-                None, p["pred_total"], edge,
-                is_bet, None, None, None, None,
+                p["game_id"], "mlb_totals_reg_live", "total",
+                p.get("model_win_prob"), p["pred_total"], info_edge,
+                is_bet, 100.0 if is_bet else None, bet_odds_decimal, None, None,
+                bet_book,
             ))
 
-            # If this is a bet, also try to update existing prediction that had no bet flag
-            if is_bet and edge is not None:
-                updates.append((edge, is_bet, p["game_id"]))
+            if is_bet and info_edge is not None:
+                updates.append(("mlb_totals_reg_live", info_edge, is_bet, bet_book, p["game_id"]))
+
+        # Classifier totals prediction
+        if "clf_info_edge" in p:
+            is_clf_bet = p.get("clf_bet", False)
+            clf_edge = p.get("clf_info_edge")
+            clf_odds = p.get("clf_best_odds")
+
+            clf_odds_decimal = _to_decimal(clf_odds) if is_clf_bet and clf_odds is not None else None
+            clf_book = p.get("clf_best_book") if is_clf_bet else None
+
+            new_rows.append((
+                p["game_id"], "mlb_totals_clf_live", "total",
+                p.get("clf_win_prob"), p.get("pred_total"), clf_edge,
+                is_clf_bet, 100.0 if is_clf_bet else None, clf_odds_decimal, None, None,
+                clf_book,
+            ))
+
+            if is_clf_bet and clf_edge is not None:
+                updates.append(("mlb_totals_clf_live", clf_edge, is_clf_bet, clf_book, p["game_id"]))
 
         # K predictions
         if "home_pred_k" in p:
             new_rows.append((
                 p["game_id"], "mlb_k_v1_live", "pitcher_k_home",
                 None, p["home_pred_k"], None,
-                False, None, None, None, None,
+                False, None, None, None, None, None,
             ))
         if "away_pred_k" in p:
             new_rows.append((
                 p["game_id"], "mlb_k_v1_live", "pitcher_k_away",
                 None, p["away_pred_k"], None,
-                False, None, None, None, None,
+                False, None, None, None, None, None,
             ))
 
     if new_rows:
@@ -389,7 +519,7 @@ def log_predictions(predictions):
             "game_id", "model_name", "market",
             "predicted_prob", "predicted_value", "edge",
             "bet_placed", "bet_amount", "bet_odds",
-            "outcome", "pnl"
+            "outcome", "pnl", "bet_book",
         ]
         try:
             bulk_insert("predictions", cols, new_rows)
@@ -399,14 +529,14 @@ def log_predictions(predictions):
 
     # Update existing totals predictions that now have odds/bet status
     if updates:
-        for edge, is_bet, game_id in updates:
+        for model_name, edge, is_bet, bet_book, game_id in updates:
             try:
                 execute("""
                     UPDATE predictions
-                    SET edge = %s, bet_placed = %s
-                    WHERE game_id = %s AND model_name = 'mlb_totals_v1_live'
+                    SET edge = %s, bet_placed = %s, bet_book = %s
+                    WHERE game_id = %s AND model_name = %s
                       AND market = 'total' AND bet_placed = false AND outcome IS NULL
-                """, [edge, is_bet, game_id])
+                """, [edge, is_bet, bet_book, game_id, model_name])
             except Exception:
                 pass
         print(f"  Updated {len(updates)} existing predictions with new odds")

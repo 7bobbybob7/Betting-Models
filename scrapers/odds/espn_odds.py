@@ -218,11 +218,21 @@ def parse_odds_item(item):
         })
 
     # --- Spread ---
-    spread_val = item.get("spread")
+    # Get the ACTUAL home spread from pointSpread (not the top-level spread which is always positive)
+    home_point_spread = home_odds.get("close", {}).get("pointSpread", {}) or home_odds.get("current", {}).get("pointSpread", {})
     home_spread_odds = home_odds.get("close", {}).get("spread", {}) or home_odds.get("current", {}).get("spread", {})
     away_spread_odds = away_odds.get("close", {}).get("spread", {}) or away_odds.get("current", {}).get("spread", {})
 
-    if spread_val is not None:
+    # Extract actual home spread value (e.g., "+1.5" or "-1.5")
+    home_spread_val = None
+    if home_point_spread:
+        ps_str = home_point_spread.get("alternateDisplayValue", "") or home_point_spread.get("american", "")
+        try:
+            home_spread_val = float(ps_str)
+        except (ValueError, TypeError):
+            pass
+
+    if home_spread_val is not None:
         home_spread_american = None
         away_spread_american = None
         if home_spread_odds:
@@ -241,8 +251,8 @@ def parse_odds_item(item):
         rows.append({
             "sportsbook": sportsbook,
             "market": "spread",
-            "home_line": float(spread_val),
-            "away_line": float(-spread_val),
+            "home_line": float(home_spread_val),
+            "away_line": float(-home_spread_val),
             "total_line": None,
             "over_odds": float(home_spread_american) if home_spread_american else None,
             "under_odds": float(away_spread_american) if away_spread_american else None,
