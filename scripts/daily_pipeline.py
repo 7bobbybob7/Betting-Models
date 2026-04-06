@@ -36,7 +36,7 @@ def load_model(path):
 
 
 def get_todays_games(target_date):
-    """Get today's scheduled/final games."""
+    """Get today's games that haven't started yet (scheduled only)."""
     dt_str = target_date.strftime("%Y-%m-%d")
     games = query("""
         SELECT g.game_id, g.game_date, g.home_score, g.away_score,
@@ -51,18 +51,19 @@ def get_todays_games(target_date):
         JOIN seasons s ON g.season_id = s.season_id
         LEFT JOIN mlb_game_info gi ON g.game_id = gi.game_id
         WHERE g.sport_id = 2 AND g.game_date = %s
+          AND g.status IN ('scheduled', 'pre_game')
     """, [dt_str])
     return games
 
 
 def get_todays_odds(game_ids):
-    """Get odds for today's games."""
+    """Get odds for today's games with full line shopping data."""
     if not game_ids:
         return {}
 
     odds = query("""
         SELECT game_id, sportsbook, market, home_line, away_line,
-               total_line, home_implied, away_implied
+               total_line, over_odds, under_odds, home_implied, away_implied
         FROM odds
         WHERE game_id = ANY(%s) AND is_closing = true
     """, [list(game_ids)])
@@ -83,6 +84,8 @@ def get_todays_odds(game_ids):
             result[gid]["total"].append({
                 "sportsbook": r["sportsbook"],
                 "total_line": float(r["total_line"]) if pd.notna(r["total_line"]) else None,
+                "over_odds": float(r["over_odds"]) if pd.notna(r["over_odds"]) else -110,
+                "under_odds": float(r["under_odds"]) if pd.notna(r["under_odds"]) else -110,
             })
 
     return result
@@ -199,7 +202,7 @@ def generate_predictions(features_df, odds_data, target_date):
             pred_total = bundle["model"].predict(X)[0]
             pred["pred_total"] = round(float(pred_total), 2)
 
-            # Compare with market total (if available)
+            # Compare with market total and find best odds (line shopping)
             total_odds = game_odds.get("total", [])
             if total_odds:
                 market_total = total_odds[0].get("total_line")
@@ -207,20 +210,55 @@ def generate_predictions(features_df, odds_data, target_date):
                     pred["market_total"] = market_total
                     pred["total_edge"] = round(float(pred_total) - market_total, 2)
 
-                    # Check if this qualifies for the conservative totals strategy
-                    month = target_date.month
-                    park_factor = game.get("park_factor", 1.0)
-                    is_postseason = game.get("is_postseason", False)
+                    # Line shopping: find best available odds for the side we'd bet
+                    bet_over = pred["total_edge"] > 0
 
-                    qualifies = (
-                        abs(pred["total_edge"]) >= 1.5 and
-                        5 <= month <= 9 and
-                        not is_postseason and
-                        park_factor >= 1.0
-                    )
-                    pred["totals_bet"] = qualifies
-                    if qualifies:
-                        pred["totals_side"] = "OVER" if pred["total_edge"] > 0 else "UNDER"
+                    if bet_over:
+                        # Find best over odds across all books
+                        best_odds = -110
+                        best_book = "unknown"
+                        for t in total_odds:
+                            ov = t.get("over_odds", -110)
+                            if ov is not None and ov > best_odds:
+                                best_odds = ov
+                                best_book = t.get("sportsbook", "unknown")
+                        pred["best_odds"] = best_odds
+                        pred["best_book"] = best_book
+                    else:
+                        # Find best under odds across all books
+                        best_odds = -110
+                        best_book = "unknown"
+                        for t in total_odds:
+                            un = t.get("under_odds", -110)
+                            if un is not None and un > best_odds:
+                                best_odds = un
+                                best_book = t.get("sportsbook", "unknown")
+                        pred["best_odds"] = best_odds
+                        pred["best_book"] = best_book
+
+                    # Compute breakeven at best available odds
+                    if best_odds >= 0:
+                        breakeven = 100 / (best_odds + 100)
+                    else:
+                        breakeven = abs(best_odds) / (abs(best_odds) + 100)
+
+                    # Use classifier approach: compute model P(over) vs market implied
+                    from scipy.stats import norm
+                    model_p_over = 1 - norm.cdf(market_total, loc=pred_total, scale=3.4)
+                    market_p_over = 0.5  # approximate de-vigged
+                    prob_edge = abs(model_p_over - market_p_over)
+
+                    # Bet if: model's win probability > breakeven at best available odds
+                    model_win_prob = model_p_over if bet_over else (1 - model_p_over)
+                    is_positive_ev = model_win_prob > breakeven
+
+                    pred["model_win_prob"] = round(float(model_win_prob), 4)
+                    pred["breakeven"] = round(float(breakeven), 4)
+                    pred["prob_edge"] = round(float(prob_edge), 4)
+
+                    pred["totals_bet"] = is_positive_ev and prob_edge >= 0.01
+                    if pred["totals_bet"]:
+                        pred["totals_side"] = "OVER" if bet_over else "UNDER"
 
         # K model predictions (for both starters)
         if "mlb_k_v1" in models and gid in starter_map:
@@ -260,21 +298,20 @@ def generate_predictions(features_df, odds_data, target_date):
         predictions.append(pred)
 
     # Display
-    print(f"\n  {'Home':<25s} {'Away':<25s} {'ML Prob':>8s} {'ML Edge':>8s} {'Pred Tot':>9s} {'Mkt Tot':>8s} {'T Edge':>7s} {'H K':>5s} {'A K':>5s} {'BET':>8s}")
-    print(f"  {'-'*120}")
+    print(f"\n  {'Home':<22s} {'Away':<22s} {'Pred':>5s} {'Mkt':>5s} {'Edge':>5s} {'Win%':>5s} {'Best':>6s} {'Book':<12s} {'BET':>6s}")
+    print(f"  {'-'*95}")
 
     bets = []
     for p in predictions:
-        ml_prob = f"{p.get('ml_prob', 0):.3f}" if "ml_prob" in p else "   —"
-        ml_edge = f"{p.get('ml_edge', 0):+.3f}" if "ml_edge" in p else "   —"
-        pred_t = f"{p.get('pred_total', 0):.1f}" if "pred_total" in p else "   —"
-        mkt_t = f"{p.get('market_total', 0):.1f}" if "market_total" in p else "   —"
-        t_edge = f"{p.get('total_edge', 0):+.1f}" if "total_edge" in p else "   —"
-        h_k = f"{p.get('home_pred_k', 0):.1f}" if "home_pred_k" in p else "  —"
-        a_k = f"{p.get('away_pred_k', 0):.1f}" if "away_pred_k" in p else "  —"
+        pred_t = f"{p.get('pred_total', 0):.1f}" if "pred_total" in p else "  —"
+        mkt_t = f"{p.get('market_total', 0):.1f}" if "market_total" in p else "  —"
+        t_edge = f"{p.get('total_edge', 0):+.1f}" if "total_edge" in p else "  —"
+        win_p = f"{p.get('model_win_prob', 0):.0%}" if "model_win_prob" in p else "  —"
+        best_o = f"{p.get('best_odds', -110):+.0f}" if "best_odds" in p else "  —"
+        book = p.get("best_book", "")[:12] if "best_book" in p else ""
         bet = p.get("totals_side", "—") if p.get("totals_bet") else "—"
 
-        print(f"  {p['home_team']:<25s} {p['away_team']:<25s} {ml_prob:>8s} {ml_edge:>8s} {pred_t:>9s} {mkt_t:>8s} {t_edge:>7s} {h_k:>5s} {a_k:>5s} {bet:>8s}")
+        print(f"  {p['home_team']:<22s} {p['away_team']:<22s} {pred_t:>5s} {mkt_t:>5s} {t_edge:>5s} {win_p:>5s} {best_o:>6s} {book:<12s} {bet:>6s}")
 
         if p.get("totals_bet"):
             bets.append(p)
@@ -282,53 +319,72 @@ def generate_predictions(features_df, odds_data, target_date):
     if bets:
         print(f"\n  ACTIONABLE BETS ({len(bets)}):")
         for b in bets:
-            print(f"    {b['totals_side']} {b['market_total']} — "
+            side = b.get('totals_side', '?')
+            total = b.get('market_total', '?')
+            odds = b.get('best_odds', -110)
+            book = b.get('best_book', '?')
+            win_p = b.get('model_win_prob', 0)
+            be = b.get('breakeven', 0.524)
+            edge_pct = (win_p - be) * 100
+            print(f"    {side} {total} at {odds:+.0f} ({book}) — "
                   f"{b['away_team']} @ {b['home_team']} "
-                  f"(model: {b['pred_total']:.1f}, edge: {b['total_edge']:+.1f} runs)")
+                  f"(win prob: {win_p:.1%}, breakeven: {be:.1%}, edge: {edge_pct:+.1f}%)")
     else:
-        print(f"\n  No actionable bets today (filters: ≥1.5 edge, May-Sept, PF≥1.0)")
+        print(f"\n  No +EV bets today")
 
-    # Log predictions to DB
+    # Log predictions to DB (new predictions insert, existing ones update if bet status changed)
     log_predictions(predictions)
 
     return predictions
 
 
 def log_predictions(predictions):
-    """Write predictions to the predictions table."""
-    rows = []
+    """Write predictions to the predictions table.
+
+    New predictions are inserted. If a totals prediction already exists
+    without a bet flag but now has odds (bet_placed=true), update it.
+    """
+    new_rows = []
+    updates = []
+
     for p in predictions:
-        # Log moneyline prediction
+        # Moneyline prediction
         if "ml_prob" in p:
-            rows.append((
+            new_rows.append((
                 p["game_id"], "mlb_logreg_v1_live", "moneyline",
                 p["ml_prob"], None, p.get("ml_edge"),
                 False, None, None, None, None,
             ))
 
-        # Log totals prediction (always, even without odds)
+        # Totals prediction
         if "pred_total" in p:
-            rows.append((
+            is_bet = p.get("totals_bet", False)
+            edge = p.get("total_edge")
+            new_rows.append((
                 p["game_id"], "mlb_totals_v1_live", "total",
-                None, p["pred_total"], p.get("total_edge"),
-                p.get("totals_bet", False), None, None, None, None,
+                None, p["pred_total"], edge,
+                is_bet, None, None, None, None,
             ))
 
-        # Log K predictions (home and away starters)
+            # If this is a bet, also try to update existing prediction that had no bet flag
+            if is_bet and edge is not None:
+                updates.append((edge, is_bet, p["game_id"]))
+
+        # K predictions
         if "home_pred_k" in p:
-            rows.append((
+            new_rows.append((
                 p["game_id"], "mlb_k_v1_live", "pitcher_k_home",
                 None, p["home_pred_k"], None,
                 False, None, None, None, None,
             ))
         if "away_pred_k" in p:
-            rows.append((
+            new_rows.append((
                 p["game_id"], "mlb_k_v1_live", "pitcher_k_away",
                 None, p["away_pred_k"], None,
                 False, None, None, None, None,
             ))
 
-    if rows:
+    if new_rows:
         cols = [
             "game_id", "model_name", "market",
             "predicted_prob", "predicted_value", "edge",
@@ -336,10 +392,24 @@ def log_predictions(predictions):
             "outcome", "pnl"
         ]
         try:
-            bulk_insert("predictions", cols, rows)
-            print(f"\n  Logged {len(rows)} predictions to DB")
+            bulk_insert("predictions", cols, new_rows)
+            print(f"\n  Logged {len(new_rows)} predictions to DB")
         except Exception as e:
             print(f"\n  Warning: could not log predictions: {e}")
+
+    # Update existing totals predictions that now have odds/bet status
+    if updates:
+        for edge, is_bet, game_id in updates:
+            try:
+                execute("""
+                    UPDATE predictions
+                    SET edge = %s, bet_placed = %s
+                    WHERE game_id = %s AND model_name = 'mlb_totals_v1_live'
+                      AND market = 'total' AND bet_placed = false AND outcome IS NULL
+                """, [edge, is_bet, game_id])
+            except Exception:
+                pass
+        print(f"  Updated {len(updates)} existing predictions with new odds")
 
 
 def main():

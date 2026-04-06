@@ -215,20 +215,26 @@ def compute_pnl():
 
     BET_AMOUNT = 100.0
 
-    # Get odds for these games
+    # Get BEST available odds per game per side (line shopping)
     odds = query("""
         SELECT game_id, over_odds, under_odds, sportsbook
         FROM odds
         WHERE market = 'total' AND is_closing = true
+          AND over_odds IS NOT NULL AND under_odds IS NOT NULL
     """)
     best_odds = {}
     for _, r in odds.iterrows():
         gid = r["game_id"]
+        over = float(r["over_odds"])
+        under = float(r["under_odds"])
         if gid not in best_odds:
-            best_odds[gid] = {
-                "over_odds": float(r["over_odds"]) if pd.notna(r["over_odds"]) else -110,
-                "under_odds": float(r["under_odds"]) if pd.notna(r["under_odds"]) else -110,
-            }
+            best_odds[gid] = {"over_odds": over, "under_odds": under}
+        else:
+            # Keep best (highest) odds for each side
+            if over > best_odds[gid]["over_odds"]:
+                best_odds[gid]["over_odds"] = over
+            if under > best_odds[gid]["under_odds"]:
+                best_odds[gid]["under_odds"] = under
 
     updated = 0
     for _, row in bets.iterrows():

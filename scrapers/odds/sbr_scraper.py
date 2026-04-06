@@ -183,12 +183,18 @@ def scrape_date(sport_key, dt):
 
     print(f"  {dt_str}: {len(game_lookup)} games in DB")
 
-    # Check what odds we already have
-    existing = query("""
+    # Check what odds we already have (by market, so moneyline doesn't block totals)
+    existing_ml = query("""
         SELECT DISTINCT game_id FROM odds
-        WHERE game_id IN (SELECT game_id FROM games WHERE sport_id = %s AND game_date = %s)
+        WHERE market = 'moneyline' AND game_id IN (SELECT game_id FROM games WHERE sport_id = %s AND game_date = %s)
     """, [sport_id, dt_str])
-    existing_ids = set(existing["game_id"]) if len(existing) > 0 else set()
+    existing_ml_ids = set(existing_ml["game_id"]) if len(existing_ml) > 0 else set()
+
+    existing_tot = query("""
+        SELECT DISTINCT game_id FROM odds
+        WHERE market = 'total' AND game_id IN (SELECT game_id FROM games WHERE sport_id = %s AND game_date = %s)
+    """, [sport_id, dt_str])
+    existing_tot_ids = set(existing_tot["game_id"]) if len(existing_tot) > 0 else set()
 
     # Fetch moneyline page
     data = fetch_sbr_page(cfg["url"], dt_str)
@@ -219,7 +225,7 @@ def scrape_date(sport_key, dt):
         if not game_id:
             continue
 
-        if game_id in existing_ids:
+        if game_id in existing_ml_ids:
             continue
 
         matched += 1
@@ -249,32 +255,56 @@ def scrape_date(sport_key, dt):
                         if away.lower() in a.lower() or a.lower() in away.lower():
                             game_id = gid
                             break
-            if not game_id or game_id in existing_ids:
+            if not game_id or game_id in existing_tot_ids:
                 continue
 
-            # Extract total from game_view
-            gv = game.get("game_view", {})
-            # Total may be in the odds structure
             odds = game.get("odds", {})
-            if isinstance(odds, dict):
+
+            # Handle list format (oddsViews from SBR)
+            if isinstance(odds, list):
+                for entry in odds:
+                    if entry is None:
+                        continue
+                    book = entry.get("sportsbook", "unknown")
+                    current = entry.get("currentLine", {})
+                    if current is None:
+                        continue
+                    total = current.get("total")
+                    over_odds_val = current.get("overOdds")
+                    under_odds_val = current.get("underOdds")
+                    if total is not None:
+                        ov = max(min(float(over_odds_val), 99999), -99999) if over_odds_val else None
+                        un = max(min(float(under_odds_val), 99999), -99999) if under_odds_val else None
+                        all_rows.append((
+                            game_id, str(book).lower().replace(" ", "_")[:30], "total",
+                            None, None, float(total),
+                            ov, un,
+                            None, None, True,
+                        ))
+
+            # Handle dict format (older data)
+            elif isinstance(odds, dict):
                 for book_key, book_data in odds.items():
                     if not isinstance(book_data, dict):
                         continue
                     current = book_data.get("currentLine", book_data)
                     total = current.get("total")
-                    over_odds = current.get("overOdds")
-                    under_odds = current.get("underOdds")
+                    over_odds_val = current.get("overOdds")
+                    under_odds_val = current.get("underOdds")
                     if total is not None:
                         book_name = book_data.get("sportsbook", book_key)
                         if isinstance(book_name, dict):
                             book_name = book_name.get("name", book_key)
+                        ov = max(min(float(over_odds_val), 99999), -99999) if over_odds_val else None
+                        un = max(min(float(under_odds_val), 99999), -99999) if under_odds_val else None
                         all_rows.append((
                             game_id, str(book_name).lower().replace(" ", "_")[:30], "total",
                             None, None, float(total),
-                            float(over_odds) if over_odds else None,
-                            float(under_odds) if under_odds else None,
+                            ov, un,
                             None, None, True,
                         ))
+    else:
+        print(f"    No totals data for {dt_str}")
 
     if all_rows:
         cols = [
