@@ -116,15 +116,26 @@ def get_sport_id():
 
 
 def pull_season_games(sport_id, year):
-    """Pull all regular season + postseason games for a given year."""
+    """Pull all regular season + postseason games for a given year.
+
+    Inserts new games and updates existing games' status/scores. For scheduled
+    games in the future, also pulls probable pitchers via schedule hydration.
+    """
     season_id = ensure_season(sport_id, year)
 
-    # Check what we already have
+    # Check what we already have (external_id -> (game_id, status, home_score, away_score))
     existing = query(
-        "SELECT external_id FROM games WHERE sport_id = %s AND season_id = %s",
+        "SELECT game_id, external_id, status, home_score, away_score FROM games WHERE sport_id = %s AND season_id = %s",
         [sport_id, season_id]
     )
-    existing_ids = set(existing["external_id"].astype(str))
+    existing_map = {}
+    for _, r in existing.iterrows():
+        existing_map[str(r["external_id"])] = {
+            "game_id": int(r["game_id"]),
+            "status": r["status"],
+            "home_score": r["home_score"],
+            "away_score": r["away_score"],
+        }
 
     # MLB regular season typically runs late March to early October
     # Postseason through November
@@ -135,7 +146,17 @@ def pull_season_games(sport_id, year):
     schedule = None
     for attempt in range(3):
         try:
-            schedule = statsapi.schedule(start_date=start_date, end_date=end_date)
+            # Use hydrated schedule to get probable pitcher IDs for upcoming games
+            raw = statsapi.get("schedule", {
+                "sportId": 1,
+                "startDate": start_date,
+                "endDate": end_date,
+                "hydrate": "probablePitcher",
+            })
+            # Flatten dates -> games
+            schedule = []
+            for d in raw.get("dates", []):
+                schedule.extend(d.get("games", []))
             break
         except Exception as e:
             print(f"  API error (attempt {attempt + 1}/3): {e}")
@@ -146,64 +167,87 @@ def pull_season_games(sport_id, year):
         return 0
 
     games_to_insert = []
-    game_info_to_insert = []
-    skipped = 0
+    probables_to_upsert = []  # (game_id, home_starter_id, away_starter_id)
+    updates = []  # (status, home_score, away_score, game_id)
     new_count = 0
+    updated_count = 0
 
     for game in tqdm(schedule, desc=f"  Processing {year}", leave=False):
-        game_pk = str(game["game_id"])
-
-        # Skip if already in DB
-        if game_pk in existing_ids:
-            skipped += 1
+        game_pk = str(game.get("gamePk", ""))
+        if not game_pk:
             continue
 
-        # Accept final games and scheduled/upcoming games
-        status = game.get("status", "")
-        if "Final" in status or "Completed" in status:
+        # Parse status
+        status_obj = game.get("status", {})
+        status_str = status_obj.get("abstractGameState", "") + " " + status_obj.get("detailedState", "")
+        if "Final" in status_str or "Completed" in status_str:
             game_status = "final"
-        elif "Scheduled" in status or "Pre-Game" in status or "Warmup" in status:
-            game_status = "scheduled"
-        elif "In Progress" in status or "Live" in status:
+        elif "Live" in status_str or "In Progress" in status_str:
             game_status = "in_progress"
+        elif "Preview" in status_str or "Scheduled" in status_str or "Pre-Game" in status_str or "Warmup" in status_str:
+            game_status = "scheduled"
         else:
             continue
 
         # Skip spring training, all-star, etc.
-        game_type = game.get("game_type", "R")
-        if game_type not in ("R", "P", "W", "D", "L", "F"):  # Regular, Postseason types
+        game_type = game.get("gameType", "R")
+        if game_type not in ("R", "P", "W", "D", "L", "F"):
             continue
 
-        home_name = game.get("home_name", "")
-        away_name = game.get("away_name", "")
+        teams = game.get("teams", {})
+        home_team_data = teams.get("home", {}).get("team", {})
+        away_team_data = teams.get("away", {}).get("team", {})
+        home_name = home_team_data.get("name", "")
+        away_name = away_team_data.get("name", "")
         if not home_name or not away_name:
             continue
 
         home_team_id = ensure_team(sport_id, home_name)
         away_team_id = ensure_team(sport_id, away_name)
 
-        game_date = game.get("game_date", "")
-        home_score = game.get("home_score")
-        away_score = game.get("away_score")
-        venue = game.get("venue_name", "")
+        # Get game date (officialDate is preferred over gameDate for DST)
+        game_date = game.get("officialDate") or game.get("gameDate", "")[:10]
+
+        home_score = teams.get("home", {}).get("score")
+        away_score = teams.get("away", {}).get("score")
+
+        venue = game.get("venue", {}).get("name", "")
         is_postseason = game_type != "R"
 
-        games_to_insert.append((
-            sport_id,
-            season_id,
-            game_pk,
-            game_date,
-            None,  # game_time
-            home_team_id,
-            away_team_id,
-            home_score if game_status == "final" else None,
-            away_score if game_status == "final" else None,
-            game_status,
-            venue,
-            is_postseason,
-            False,  # is_neutral_site
-        ))
-        new_count += 1
+        # Extract probable pitchers (hydrated)
+        home_prob = teams.get("home", {}).get("probablePitcher", {})
+        away_prob = teams.get("away", {}).get("probablePitcher", {})
+        home_starter_id = None
+        away_starter_id = None
+        if home_prob and home_prob.get("id"):
+            home_starter_id = ensure_player(sport_id, home_prob["id"], home_prob.get("fullName", ""), "P")
+        if away_prob and away_prob.get("id"):
+            away_starter_id = ensure_player(sport_id, away_prob["id"], away_prob.get("fullName", ""), "P")
+
+        if game_pk in existing_map:
+            # Game exists — check if status or scores changed
+            ex = existing_map[game_pk]
+            new_home_score = home_score if game_status == "final" else None
+            new_away_score = away_score if game_status == "final" else None
+            if (ex["status"] != game_status or
+                ex["home_score"] != new_home_score or
+                ex["away_score"] != new_away_score):
+                updates.append((game_status, new_home_score, new_away_score, ex["game_id"]))
+                updated_count += 1
+            # Track probable pitcher info for mlb_game_info upsert
+            if home_starter_id or away_starter_id:
+                probables_to_upsert.append((ex["game_id"], home_starter_id, away_starter_id))
+        else:
+            # New game — insert
+            games_to_insert.append((
+                sport_id, season_id, game_pk, game_date,
+                None,  # game_time
+                home_team_id, away_team_id,
+                home_score if game_status == "final" else None,
+                away_score if game_status == "final" else None,
+                game_status, venue, is_postseason, False,
+            ))
+            new_count += 1
 
     if games_to_insert:
         columns = [
@@ -213,7 +257,32 @@ def pull_season_games(sport_id, year):
         ]
         bulk_insert("games", columns, games_to_insert)
 
-    print(f"  {year}: {new_count} new games inserted, {skipped} already existed")
+    # Apply updates to existing games
+    for game_status, h_score, a_score, game_id in updates:
+        try:
+            execute(
+                "UPDATE games SET status = %s, home_score = %s, away_score = %s WHERE game_id = %s",
+                [game_status, h_score, a_score, game_id]
+            )
+        except Exception as e:
+            print(f"  Failed to update game {game_id}: {e}")
+
+    # Upsert probable pitchers into mlb_game_info
+    for game_id, h_starter, a_starter in probables_to_upsert:
+        if h_starter is None and a_starter is None:
+            continue
+        try:
+            execute("""
+                INSERT INTO mlb_game_info (game_id, home_starter_id, away_starter_id)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (game_id) DO UPDATE
+                SET home_starter_id = COALESCE(EXCLUDED.home_starter_id, mlb_game_info.home_starter_id),
+                    away_starter_id = COALESCE(EXCLUDED.away_starter_id, mlb_game_info.away_starter_id)
+            """, [game_id, h_starter, a_starter])
+        except Exception:
+            pass
+
+    print(f"  {year}: {new_count} new, {updated_count} updated, {len(probables_to_upsert)} with probable pitchers")
     return new_count
 
 

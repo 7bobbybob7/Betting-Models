@@ -95,10 +95,9 @@ def build_quick_features(games_df):
     """Build features for today's games using the full feature pipeline."""
     from models.mlb.features import build_feature_matrix
 
-    # Build full matrix (loads all historical data, computes rolling features)
-    # Filter to current season
+    # Build full matrix including scheduled games (so today's games get features)
     current_year = date.today().year
-    df = build_feature_matrix(current_year, current_year)
+    df = build_feature_matrix(current_year, current_year, include_scheduled=True)
 
     # Filter to just today's game IDs
     today_ids = set(games_df["game_id"].astype(int))
@@ -141,18 +140,21 @@ def generate_predictions(features_df, odds_data, target_date):
             print(f"  Warning: Statcast features failed: {e}")
 
     # Get starter mapping for K model
+    # Final games → actual starter from mlb_pitching_game
+    # Scheduled games → probable starter from mlb_game_info
     starter_map = {}
     if "mlb_k_v1" in models:
         from db.db import query as db_query
         starters = db_query("""
             SELECT g.game_id, g.home_team_id, g.away_team_id,
-                   hp.player_id as home_starter, ap.player_id as away_starter,
-                   hp.so as home_k_history, ap.so as away_k_history
+                   COALESCE(hp.player_id, gi.home_starter_id) as home_starter,
+                   COALESCE(ap.player_id, gi.away_starter_id) as away_starter
             FROM games g
             LEFT JOIN mlb_pitching_game hp ON g.game_id = hp.game_id
                 AND hp.team_id = g.home_team_id AND hp.is_starter = true
             LEFT JOIN mlb_pitching_game ap ON g.game_id = ap.game_id
                 AND ap.team_id = g.away_team_id AND ap.is_starter = true
+            LEFT JOIN mlb_game_info gi ON g.game_id = gi.game_id
             WHERE g.sport_id = 2
         """)
         for _, r in starters.iterrows():
@@ -464,7 +466,7 @@ def log_predictions(predictions):
 
         # Regression totals prediction
         if "pred_total" in p:
-            is_bet = p.get("totals_bet", False)
+            is_bet = bool(p.get("totals_bet", False))
             info_edge = p.get("info_edge")
             best_odds = p.get("best_odds")
 
@@ -473,32 +475,33 @@ def log_predictions(predictions):
 
             new_rows.append((
                 p["game_id"], "mlb_totals_reg_live", "total",
-                p.get("model_win_prob"), p["pred_total"], info_edge,
+                p.get("model_win_prob"), float(p["pred_total"]), info_edge,
                 is_bet, 100.0 if is_bet else None, bet_odds_decimal, None, None,
                 bet_book,
             ))
 
             if is_bet and info_edge is not None:
-                updates.append(("mlb_totals_reg_live", info_edge, is_bet, bet_book, p["game_id"]))
+                updates.append(("mlb_totals_reg_live", info_edge, is_bet, bet_book, bet_odds_decimal, p["game_id"]))
 
         # Classifier totals prediction
         if "clf_info_edge" in p:
-            is_clf_bet = p.get("clf_bet", False)
+            is_clf_bet = bool(p.get("clf_bet", False))
             clf_edge = p.get("clf_info_edge")
             clf_odds = p.get("clf_best_odds")
 
             clf_odds_decimal = _to_decimal(clf_odds) if is_clf_bet and clf_odds is not None else None
             clf_book = p.get("clf_best_book") if is_clf_bet else None
 
+            pred_total_val = float(p["pred_total"]) if "pred_total" in p else None
             new_rows.append((
                 p["game_id"], "mlb_totals_clf_live", "total",
-                p.get("clf_win_prob"), p.get("pred_total"), clf_edge,
+                p.get("clf_win_prob"), pred_total_val, clf_edge,
                 is_clf_bet, 100.0 if is_clf_bet else None, clf_odds_decimal, None, None,
                 clf_book,
             ))
 
             if is_clf_bet and clf_edge is not None:
-                updates.append(("mlb_totals_clf_live", clf_edge, is_clf_bet, clf_book, p["game_id"]))
+                updates.append(("mlb_totals_clf_live", clf_edge, is_clf_bet, clf_book, clf_odds_decimal, p["game_id"]))
 
         # K predictions
         if "home_pred_k" in p:
@@ -529,14 +532,16 @@ def log_predictions(predictions):
 
     # Update existing totals predictions that now have odds/bet status
     if updates:
-        for model_name, edge, is_bet, bet_book, game_id in updates:
+        for model_name, edge, is_bet, bet_book, bet_odds_dec, game_id in updates:
             try:
                 execute("""
                     UPDATE predictions
-                    SET edge = %s, bet_placed = %s, bet_book = %s
+                    SET edge = %s, bet_placed = %s, bet_book = %s,
+                        bet_odds = %s, bet_amount = %s
                     WHERE game_id = %s AND model_name = %s
                       AND market = 'total' AND bet_placed = false AND outcome IS NULL
-                """, [edge, is_bet, bet_book, game_id, model_name])
+                """, [edge, is_bet, bet_book, bet_odds_dec,
+                      100.0 if is_bet else None, game_id, model_name])
             except Exception:
                 pass
         print(f"  Updated {len(updates)} existing predictions with new odds")

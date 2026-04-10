@@ -75,17 +75,22 @@ def load_batting():
     """)
 
 
-def load_games():
-    """Load all MLB games with team names, starters (from pitching table), and game info."""
-    return query("""
+def load_games(include_scheduled=False):
+    """Load all MLB games with team names, starters, and game info.
+
+    For final games, starters come from mlb_pitching_game (actual starter).
+    For scheduled games, starters come from mlb_game_info (probable pitcher).
+    """
+    status_filter = "g.status = 'final'" if not include_scheduled else "g.status IN ('final', 'scheduled', 'pre_game', 'in_progress')"
+    return query(f"""
         SELECT
-            g.game_id, g.game_date, g.season_id,
+            g.game_id, g.game_date, g.season_id, g.status,
             g.home_team_id, g.away_team_id,
             g.home_score, g.away_score,
             g.venue, g.is_postseason,
             ht.name as home_team, at.name as away_team,
-            hp.player_id as home_starter_id,
-            ap.player_id as away_starter_id,
+            COALESCE(hp.player_id, gi.home_starter_id) as home_starter_id,
+            COALESCE(ap.player_id, gi.away_starter_id) as away_starter_id,
             gi.weather_temp, gi.weather_wind, gi.weather_cond,
             s.year as season_year
         FROM games g
@@ -97,7 +102,7 @@ def load_games():
             AND ap.team_id = g.away_team_id AND ap.is_starter = true
         LEFT JOIN mlb_game_info gi ON g.game_id = gi.game_id
         JOIN seasons s ON g.season_id = s.season_id
-        WHERE g.sport_id = 2 AND g.status = 'final'
+        WHERE g.sport_id = 2 AND {status_filter}
         ORDER BY g.game_date, g.game_id
     """)
 
@@ -414,7 +419,7 @@ def compute_park_factors(games_df):
     Returns dict: venue -> park_factor
     """
     print("  Computing park factors...")
-    games_df = games_df.copy()
+    games_df = games_df[games_df["home_score"].notna() & games_df["away_score"].notna()].copy()
     games_df["total_runs"] = games_df["home_score"] + games_df["away_score"]
 
     league_avg = games_df["total_runs"].mean()
@@ -432,10 +437,94 @@ def compute_park_factors(games_df):
 # ---------------------------------------------------------------------------
 # Assemble feature matrix
 # ---------------------------------------------------------------------------
-def build_feature_matrix(start_year, end_year):
-    """Build the full game-level feature matrix."""
+def _inject_scheduled_games(games, pitching, batting, bullpen):
+    """Add synthetic rows to pitching/batting/bullpen for scheduled games.
+
+    For the rolling feature computation to work on scheduled games, each needs
+    a row in the pitching/batting data. The synthetic row has zero stats — only
+    the game_id, player_id/team_id, and game_date are needed so the function
+    computes rolling features from PRIOR real entries.
+    """
+    scheduled = games[games["status"] != "final"]
+    if len(scheduled) == 0:
+        return pitching, batting, bullpen
+
+    # Synthetic pitching rows for probable starters
+    synth_pitch = []
+    for _, g in scheduled.iterrows():
+        for starter_id, team_id in [
+            (g.get("home_starter_id"), g["home_team_id"]),
+            (g.get("away_starter_id"), g["away_team_id"]),
+        ]:
+            if pd.isna(starter_id) if isinstance(starter_id, float) else starter_id is None:
+                continue
+            synth_pitch.append({
+                "game_id": int(g["game_id"]),
+                "player_id": int(starter_id),
+                "team_id": int(team_id),
+                "is_starter": True,
+                "ip": 0, "hits_allowed": 0, "runs": 0, "earned_runs": 0,
+                "bb": 0, "so": 0, "hr_allowed": 0, "pitches": 0, "strikes": 0,
+                "game_date": g["game_date"],
+                "home_team_id": int(g["home_team_id"]),
+                "away_team_id": int(g["away_team_id"]),
+                "season_id": g["season_id"],
+            })
+
+    if synth_pitch:
+        pitching = pd.concat([pitching, pd.DataFrame(synth_pitch)], ignore_index=True)
+        pitching = pitching.sort_values("game_date").reset_index(drop=True)
+
+    # Synthetic batting rows for each team in scheduled games
+    synth_bat = []
+    for _, g in scheduled.iterrows():
+        for team_id in [g["home_team_id"], g["away_team_id"]]:
+            synth_bat.append({
+                "game_id": int(g["game_id"]),
+                "team_id": int(team_id),
+                "pa": 0, "ab": 0, "hits": 0, "doubles": 0, "triples": 0,
+                "hr": 0, "rbi": 0, "bb": 0, "so": 0, "hbp": 0,
+                "sb": 0, "cs": 0,
+                "game_date": g["game_date"],
+                "home_team_id": int(g["home_team_id"]),
+                "away_team_id": int(g["away_team_id"]),
+                "home_score": 0, "away_score": 0,
+            })
+
+    if synth_bat:
+        batting = pd.concat([batting, pd.DataFrame(synth_bat)], ignore_index=True)
+        batting = batting.sort_values("game_date").reset_index(drop=True)
+
+    # Synthetic bullpen rows (per team, per scheduled game)
+    synth_bp = []
+    for _, g in scheduled.iterrows():
+        for team_id in [g["home_team_id"], g["away_team_id"]]:
+            synth_bp.append({
+                "game_id": int(g["game_id"]),
+                "player_id": 0,  # dummy
+                "team_id": int(team_id),
+                "ip": 0, "hits_allowed": 0, "earned_runs": 0,
+                "bb": 0, "so": 0, "hr_allowed": 0,
+                "game_date": g["game_date"],
+                "home_team_id": int(g["home_team_id"]),
+                "away_team_id": int(g["away_team_id"]),
+            })
+
+    if synth_bp:
+        bullpen = pd.concat([bullpen, pd.DataFrame(synth_bp)], ignore_index=True)
+        bullpen = bullpen.sort_values("game_date").reset_index(drop=True)
+
+    return pitching, batting, bullpen
+
+
+def build_feature_matrix(start_year, end_year, include_scheduled=False):
+    """Build the full game-level feature matrix.
+
+    When include_scheduled=True, also builds feature rows for scheduled/upcoming
+    games using probable pitcher info and rolling team stats from prior games.
+    """
     print(f"\nLoading data...")
-    games = load_games()
+    games = load_games(include_scheduled=include_scheduled)
     pitching = load_pitching()
     batting = load_batting()
     bullpen_raw = load_bullpen()
@@ -445,6 +534,10 @@ def build_feature_matrix(start_year, end_year):
     # Filter to requested years
     games = games[(games["season_year"] >= start_year) & (games["season_year"] <= end_year)]
     print(f"  Filtered to {start_year}-{end_year}: {len(games)} games")
+
+    # Inject synthetic rows for scheduled games so rolling features get computed
+    if include_scheduled:
+        pitching, batting, bullpen_raw = _inject_scheduled_games(games, pitching, batting, bullpen_raw)
 
     # Build features
     pitcher_feats = build_pitcher_features(pitching)
@@ -467,15 +560,19 @@ def build_feature_matrix(start_year, end_year):
         home_tid = int(game["home_team_id"])
         away_tid = int(game["away_team_id"])
 
+        home_score = game["home_score"]
+        away_score = game["away_score"]
+        has_scores = pd.notna(home_score) and pd.notna(away_score)
+
         row = {
             "game_id": gid,
             "game_date": game["game_date"],
             "season": int(game["season_year"]),
             "home_team": game["home_team"],
             "away_team": game["away_team"],
-            "home_score": game["home_score"],
-            "away_score": game["away_score"],
-            "home_win": 1 if game["home_score"] > game["away_score"] else 0,
+            "home_score": home_score if has_scores else None,
+            "away_score": away_score if has_scores else None,
+            "home_win": (1 if home_score > away_score else 0) if has_scores else None,
             "is_postseason": game["is_postseason"],
         }
 
