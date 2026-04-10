@@ -287,7 +287,7 @@ def compute_clv():
         SELECT p.prediction_id, p.game_id, p.model_name, p.edge, p.bet_odds,
                p.bet_book, p.outcome
         FROM predictions p
-        WHERE p.model_name IN ('mlb_totals_reg_live', 'mlb_totals_clf_live', 'mlb_totals_v1_live')
+        WHERE p.model_name IN ('mlb_totals_reg_live', 'mlb_totals_clf_live', 'mlb_totals_clf_be_live', 'mlb_totals_v1_live')
           AND p.market = 'total' AND p.bet_placed = true AND p.outcome IS NOT NULL
           AND p.clv_model IS NULL
     """)
@@ -456,7 +456,7 @@ def print_bankroll_summary():
             ) as rn
             FROM predictions
             WHERE bet_placed = true
-              AND model_name IN ('mlb_totals_reg_live', 'mlb_totals_clf_live', 'mlb_totals_v1_live')
+              AND model_name IN ('mlb_totals_reg_live', 'mlb_totals_clf_live', 'mlb_totals_clf_be_live', 'mlb_totals_v1_live')
               AND market = 'total'
         )
         SELECT
@@ -495,7 +495,7 @@ def print_bankroll_summary():
     all_totals = query("""
         SELECT p.model_name, p.edge, p.outcome
         FROM predictions p
-        WHERE p.model_name IN ('mlb_totals_reg_live', 'mlb_totals_clf_live', 'mlb_totals_v1_live')
+        WHERE p.model_name IN ('mlb_totals_reg_live', 'mlb_totals_clf_live', 'mlb_totals_clf_be_live', 'mlb_totals_v1_live')
           AND p.market = 'total' AND p.outcome IS NOT NULL AND p.edge IS NOT NULL
     """)
 

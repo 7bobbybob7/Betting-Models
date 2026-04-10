@@ -208,7 +208,7 @@ def get_bankroll():
             ) as rn
             FROM predictions
             WHERE bet_placed = true
-              AND model_name IN ('mlb_totals_reg_live', 'mlb_totals_clf_live', 'mlb_totals_v1_live')
+              AND model_name IN ('mlb_totals_reg_live', 'mlb_totals_clf_live', 'mlb_totals_clf_be_live', 'mlb_totals_v1_live')
               AND market = 'total'
         )
         SELECT

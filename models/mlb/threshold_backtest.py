@@ -363,54 +363,169 @@ def main():
             })
 
     rdf_clf = pd.DataFrame(clf_results)
-    run_threshold_table(rdf_clf, "Direct Classifier (LogReg L1)", thresholds)
+    run_threshold_table(rdf_clf, "Direct Classifier (LogReg L1) — devig comparison", thresholds)
+
+    # ==========================================================
+    # APPROACH 3: CLASSIFIER vs BEST-ODDS IMPLIED (no de-vig step)
+    # Same model, compares against best-available odds implied probability.
+    # Line shopping is part of the edge — every bet must beat the actual price.
+    # ==========================================================
+    print(f"\n{'='*70}")
+    print("  APPROACH 3: CLASSIFIER vs BEST-ODDS IMPLIED (no de-vig)")
+    print(f"{'='*70}")
+
+    clf_be_results = []
+
+    for test_year in range(2019, 2025):
+        train_rows = []
+        test_rows = []
+
+        for split_df, target_list in [(df[df["season"].between(2016, test_year - 1)], train_rows),
+                                       (df[df["season"] == test_year], test_rows)]:
+            for _, row in split_df.iterrows():
+                gid = int(row["game_id"])
+                if gid not in odds_by_game:
+                    continue
+                books = odds_by_game[gid]
+                line_counts = defaultdict(int)
+                for b in books:
+                    line_counts[b["total_line"]] += 1
+                market_total = max(line_counts, key=line_counts.get)
+                books_on_line = [b for b in books if b["total_line"] == market_total]
+                actual_total = row["total_runs"]
+                if actual_total == market_total:
+                    continue
+
+                feat = {c: row[c] for c in available}
+                home_rpg = row.get("home_b_rpg_15", 0) or 0
+                away_rpg = row.get("away_b_rpg_15", 0) or 0
+                feat["market_line"] = market_total
+                feat["rpg_vs_line"] = home_rpg + away_rpg - market_total
+                feat["target"] = 1 if actual_total > market_total else 0
+                feat["game_id"] = gid
+                feat["season"] = int(row["season"])
+                feat["over_odds_list"] = [b["over_odds"] for b in books_on_line]
+                feat["under_odds_list"] = [b["under_odds"] for b in books_on_line]
+                feat["n_books"] = len(books_on_line)
+                target_list.append(feat)
+
+        if not train_rows or not test_rows:
+            continue
+
+        train_df_be = pd.DataFrame(train_rows)
+        test_df_be = pd.DataFrame(test_rows)
+
+        clf_features = available + ["market_line", "rpg_vs_line"]
+        clf_avail = [c for c in clf_features if c in train_df_be.columns]
+
+        X_tr = train_df_be[clf_avail].fillna(train_df_be[clf_avail].median())
+        X_te = test_df_be[clf_avail].fillna(train_df_be[clf_avail].median())
+
+        sc = StandardScaler()
+        clf = LogisticRegression(penalty="l1", C=0.1, solver="saga", max_iter=5000, random_state=42)
+        clf.fit(sc.fit_transform(X_tr), train_df_be["target"])
+        probs = clf.predict_proba(sc.transform(X_te))[:, 1]
+
+        for i, (_, row) in enumerate(test_df_be.iterrows()):
+            over_odds_list = row["over_odds_list"]
+            under_odds_list = row["under_odds_list"]
+
+            # Best available odds (line shopping)
+            best_over_am = max(over_odds_list)
+            best_under_am = max(under_odds_list)
+            over_best_implied = implied_from_american(best_over_am)
+            under_best_implied = implied_from_american(best_under_am)
+
+            model_p_over = probs[i]
+            model_p_under = 1 - model_p_over
+
+            # Edge = model_p - best_odds_implied (NO de-vig)
+            over_edge = model_p_over - over_best_implied
+            under_edge = model_p_under - under_best_implied
+
+            if over_edge > under_edge:
+                bet_side = "over"
+                edge = over_edge
+                model_win_prob = model_p_over
+                best_american = best_over_am
+            else:
+                bet_side = "under"
+                edge = under_edge
+                model_win_prob = model_p_under
+                best_american = best_under_am
+
+            best_decimal = american_to_decimal(best_american)
+            breakeven = 1 / best_decimal
+            # No separate EV gate — comparing against best odds IS the EV check.
+            # When edge > 0, the bet is +EV by definition.
+            bet_ev = edge
+
+            actual_over = row["target"] == 1
+            bet_over = bet_side == "over"
+            correct = bet_over == actual_over
+
+            clf_be_results.append({
+                "game_id": int(row["game_id"]), "season": int(row["season"]),
+                "info_edge": edge, "model_win_prob": model_win_prob,
+                "breakeven": breakeven, "bet_ev": bet_ev,
+                "bet_over": bet_over, "correct": correct,
+                "best_odds_decimal": best_decimal, "n_books": int(row["n_books"]),
+            })
+
+    rdf_clf_be = pd.DataFrame(clf_be_results)
+    run_threshold_table(rdf_clf_be, "Classifier (LogReg L1) — best-odds implied comparison", thresholds)
 
     # ==========================================================
     # PER-SEASON for best approach
     # ==========================================================
     print(f"\n{'='*70}")
-    print("  PER-SEASON BREAKDOWN: CLASSIFIER ≥1.0% + EV gate")
+    print("  PER-SEASON BREAKDOWN: CLASSIFIER (devig) ≥3.0% + EV gate")
     print(f"{'='*70}")
-    run_season_breakdown(rdf_clf, 0.01)
+    run_season_breakdown(rdf_clf, 0.03)
 
-    print(f"\n  PER-SEASON BREAKDOWN: CLASSIFIER ≥0.5% + EV gate")
-    run_season_breakdown(rdf_clf, 0.005)
+    print(f"\n{'='*70}")
+    print("  PER-SEASON BREAKDOWN: CLASSIFIER (best-edge) ≥3.0%")
+    print(f"{'='*70}")
+    run_season_breakdown(rdf_clf_be, 0.03)
 
     # ==========================================================
     # BANKROLL SIMULATION
     # ==========================================================
     print(f"\n{'='*70}")
-    print(f"  BANKROLL SIM: CLASSIFIER ($10K start, $100 flat)")
+    print(f"  BANKROLL SIM ($10K start, $100 flat)")
     print(f"{'='*70}")
 
-    for threshold in [0.005, 0.01, 0.02]:
-        subset = rdf_clf[(rdf_clf["info_edge"] >= threshold) & (rdf_clf["bet_ev"] > 0)].sort_values(["season", "game_id"])
-        if len(subset) == 0:
-            continue
+    for label, rdf, thresholds_to_test in [
+        ("Regression", rdf_reg, [0.005, 0.01, 0.02]),
+        ("Classifier (devig)", rdf_clf, [0.02, 0.03, 0.05]),
+        ("Classifier (best-edge)", rdf_clf_be, [0.02, 0.03, 0.05]),
+    ]:
+        print(f"\n  {label}:")
+        for threshold in thresholds_to_test:
+            subset = rdf[(rdf["info_edge"] >= threshold) & (rdf["bet_ev"] > 0)].sort_values(["season", "game_id"])
+            if len(subset) == 0:
+                continue
 
-        bankroll = 10000
-        peak = bankroll
-        max_dd = 0
-        max_lose = 0
-        cur_lose = 0
+            bankroll = 10000
+            peak = bankroll
+            max_dd = 0
+            max_lose = 0
+            cur_lose = 0
 
-        for _, g in subset.iterrows():
-            if g["correct"]:
-                bankroll += 100 * (g["best_odds_decimal"] - 1)
-                cur_lose = 0
-            else:
-                bankroll -= 100
-                cur_lose += 1
-                max_lose = max(max_lose, cur_lose)
-            peak = max(peak, bankroll)
-            dd = (peak - bankroll) / peak
-            max_dd = max(max_dd, dd)
+            for _, g in subset.iterrows():
+                if g["correct"]:
+                    bankroll += 100 * (g["best_odds_decimal"] - 1)
+                    cur_lose = 0
+                else:
+                    bankroll -= 100
+                    cur_lose += 1
+                    max_lose = max(max_lose, cur_lose)
+                peak = max(peak, bankroll)
+                dd = (peak - bankroll) / peak
+                max_dd = max(max_dd, dd)
 
-        total_profit = bankroll - 10000
-        print(f"\n  ≥{threshold:.1%}: {len(subset)} bets over 6 years")
-        print(f"    Final: ${bankroll:,.0f} (${total_profit:+,.0f})")
-        print(f"    Max drawdown: {max_dd:.1%}")
-        print(f"    Max losing streak: {max_lose}")
+            total_profit = bankroll - 10000
+            print(f"    ≥{threshold:.1%}: {len(subset)} bets, final ${bankroll:,.0f} ({total_profit:+,.0f}), max DD {max_dd:.0%}, max losing streak {max_lose}")
 
 
 if __name__ == "__main__":
