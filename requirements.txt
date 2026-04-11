@@ -2,7 +2,7 @@ psycopg2-binary
 python-dotenv
 pandas
 numpy
-scikit-learn
+scikit-learn==1.4.2
 xgboost
 streamlit
 pybaseball
@@ -12,5 +12,6 @@ tqdm
 fastapi
 uvicorn
 matplotlib
+scipy
 statsmodels
 nba_api
