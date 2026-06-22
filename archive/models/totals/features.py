@@ -91,7 +91,8 @@ def load_games(include_scheduled=False):
             ht.name as home_team, at.name as away_team,
             COALESCE(hp.player_id, gi.home_starter_id) as home_starter_id,
             COALESCE(ap.player_id, gi.away_starter_id) as away_starter_id,
-            gi.weather_temp, gi.weather_wind, gi.weather_cond,
+            gi.weather_temp, gi.weather_wind, gi.weather_dir, gi.weather_cond,
+            gi.umpire_hp,
             s.year as season_year
         FROM games g
         JOIN teams ht ON g.home_team_id = ht.team_id
@@ -407,7 +408,83 @@ def build_bullpen_features(bullpen_df):
 def _empty_bullpen_features():
     return {k: None for k in [
         "bp_era_7d", "bp_whip_7d", "bp_k9_7d", "bp_ip_7d", "bp_ip_3d",
+        "bp_high_lev_avail",
     ]}
+
+
+def build_bullpen_availability(bullpen_raw):
+    """
+    Build high-leverage bullpen availability feature per team per game.
+
+    For each team/game, identifies the top relievers (by save+hold rate in
+    trailing 30 days) and checks how many are available (haven't pitched in
+    the last 2 days). Returns a fraction: 1.0 = all top relievers rested,
+    0.0 = all recently used.
+
+    Returns dict: (game_id, team_id) -> availability fraction
+    """
+    print("  Building bullpen availability...")
+    bp = bullpen_raw.copy()
+    bp = bp.sort_values("game_date")
+
+    # Load decision data for save/hold classification
+    from db.db import query as db_query
+    decisions = db_query("""
+        SELECT pg.game_id, pg.player_id, pg.decision
+        FROM mlb_pitching_game pg
+        WHERE pg.is_starter = false AND pg.decision IN ('S', 'H')
+    """)
+    # Map (game_id, player_id) -> has_save_or_hold
+    sh_set = set()
+    for _, r in decisions.iterrows():
+        sh_set.add((int(r["game_id"]), int(r["player_id"])))
+
+    # Mark high-leverage appearances in bullpen data
+    bp["is_high_lev"] = bp.apply(
+        lambda r: (int(r["game_id"]), int(r["player_id"])) in sh_set, axis=1
+    )
+
+    availability = {}
+
+    for tid, grp in tqdm(bp.groupby("team_id"), desc="  BP Avail", leave=False):
+        grp = grp.sort_values("game_date").reset_index(drop=True)
+
+        # Get unique game dates for this team
+        game_dates = grp.groupby("game_id")["game_date"].first().reset_index()
+        game_dates = game_dates.sort_values("game_date")
+
+        for _, gd_row in game_dates.iterrows():
+            game_id = int(gd_row["game_id"])
+            game_date = gd_row["game_date"]
+
+            # Trailing 30-day window to identify top relievers
+            mask_30d = (grp["game_date"] < game_date) & \
+                       (grp["game_date"] >= game_date - pd.Timedelta(days=30))
+            recent = grp[mask_30d]
+
+            if len(recent) < 5:
+                availability[(game_id, tid)] = None
+                continue
+
+            # Rank relievers by save+hold appearances in the window
+            reliever_scores = recent.groupby("player_id")["is_high_lev"].sum()
+            # Top 3 relievers by high-leverage appearances
+            top_relievers = reliever_scores.nlargest(3).index.tolist()
+
+            if len(top_relievers) == 0:
+                availability[(game_id, tid)] = None
+                continue
+
+            # Check which of the top relievers pitched in the last 2 days
+            mask_2d = (grp["game_date"] < game_date) & \
+                      (grp["game_date"] >= game_date - pd.Timedelta(days=2))
+            recent_2d = grp[mask_2d]
+            recently_used = set(recent_2d["player_id"].unique())
+
+            available_count = sum(1 for p in top_relievers if p not in recently_used)
+            availability[(game_id, tid)] = round(available_count / len(top_relievers), 2)
+
+    return availability
 
 
 # ---------------------------------------------------------------------------
@@ -517,6 +594,41 @@ def _inject_scheduled_games(games, pitching, batting, bullpen):
     return pitching, batting, bullpen
 
 
+def _build_umpire_zones():
+    """Compute per-umpire called strike rate from Statcast data.
+
+    Uses only borderline pitches (zones 11-14 = shadow zone) to measure
+    how wide each umpire's zone is. A higher rate = wider zone = more K's = fewer runs.
+
+    Returns dict: umpire_name -> {"zone_rate": float, "games": int}
+    """
+    ump_data = query("""
+        SELECT gi.umpire_hp,
+               COUNT(*) as borderline_pitches,
+               SUM(CASE WHEN p.is_strike AND p.description = 'called_strike' THEN 1 ELSE 0 END) as called_strikes
+        FROM mlb_pitches p
+        JOIN mlb_game_info gi ON p.game_id = gi.game_id
+        WHERE gi.umpire_hp IS NOT NULL
+          AND p.zone BETWEEN 11 AND 14
+        GROUP BY gi.umpire_hp
+        HAVING COUNT(*) >= 200
+    """)
+
+    zones = {}
+    if len(ump_data) > 0:
+        league_avg = ump_data["called_strikes"].sum() / ump_data["borderline_pitches"].sum()
+        for _, r in ump_data.iterrows():
+            name = r["umpire_hp"]
+            rate = r["called_strikes"] / r["borderline_pitches"]
+            zones[name] = {
+                "zone_rate": round(rate, 4),
+                "zone_vs_avg": round(rate - league_avg, 4),  # positive = wider zone = fewer runs
+                "pitches": int(r["borderline_pitches"]),
+            }
+
+    return zones
+
+
 def build_feature_matrix(start_year, end_year, include_scheduled=False):
     """Build the full game-level feature matrix.
 
@@ -539,10 +651,15 @@ def build_feature_matrix(start_year, end_year, include_scheduled=False):
     if include_scheduled:
         pitching, batting, bullpen_raw = _inject_scheduled_games(games, pitching, batting, bullpen_raw)
 
+    # Build umpire zone metrics from Statcast (before main feature build)
+    print("  Building umpire zone metrics...")
+    umpire_zones = _build_umpire_zones()
+
     # Build features
     pitcher_feats = build_pitcher_features(pitching)
     batting_feats = build_batting_features(batting)
     bullpen_feats = build_bullpen_features(bullpen_raw)
+    bp_availability = build_bullpen_availability(bullpen_raw)
     park_factors = compute_park_factors(games)
 
     # Build ELO
@@ -615,6 +732,10 @@ def build_feature_matrix(start_year, end_year, include_scheduled=False):
         for k, v in a_bp.items():
             row[f"away_{k}"] = v
 
+        # Bullpen availability (high-leverage reliever freshness)
+        row["home_bp_high_lev_avail"] = bp_availability.get((gid, home_tid))
+        row["away_bp_high_lev_avail"] = bp_availability.get((gid, away_tid))
+
         # ELO features
         game_elo = elo_data.get(gid, {})
         row["home_elo"] = game_elo.get("home_elo")
@@ -628,6 +749,37 @@ def build_feature_matrix(start_year, end_year, include_scheduled=False):
         row["park_factor"] = park_factors.get(game["venue"], 1.0)
         row["weather_temp"] = game.get("weather_temp")
         row["weather_wind"] = game.get("weather_wind")
+
+        # Wind direction: encode as run-impact categories
+        wind_dir = game.get("weather_dir")
+        if wind_dir and isinstance(wind_dir, str):
+            wind_dir = wind_dir.strip().rstrip(".")
+            if "out to" in wind_dir:
+                row["wind_out"] = 1  # run-boosting
+                row["wind_in"] = 0
+            elif "in from" in wind_dir:
+                row["wind_out"] = 0
+                row["wind_in"] = 1  # run-suppressing
+            else:
+                row["wind_out"] = 0
+                row["wind_in"] = 0
+        else:
+            row["wind_out"] = None
+            row["wind_in"] = None
+
+        # Dome indicator (from weather_cond)
+        weather_cond = game.get("weather_cond")
+        if weather_cond and isinstance(weather_cond, str):
+            row["is_dome"] = 1 if weather_cond.strip().rstrip(".") in ("dome", "roof closed") else 0
+        else:
+            row["is_dome"] = None
+
+        # Umpire zone (wider zone = more K's = fewer runs)
+        ump_name = game.get("umpire_hp")
+        if ump_name and ump_name in umpire_zones:
+            row["ump_zone_vs_avg"] = umpire_zones[ump_name]["zone_vs_avg"]
+        else:
+            row["ump_zone_vs_avg"] = None
 
         rows.append(row)
 

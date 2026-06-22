@@ -136,6 +136,8 @@ def extract_moneyline_odds(game_data):
             if entry is None:
                 continue
             book = entry.get("sportsbook", "unknown")
+            book_key = str(book).lower().replace(" ", "_")[:30]
+
             current = entry.get("currentLine", {})
             if current is None:
                 continue
@@ -145,10 +147,24 @@ def extract_moneyline_odds(game_data):
                 home_ml_f = max(min(float(home_ml), 99999), -99999)
                 away_ml_f = max(min(float(away_ml), 99999), -99999)
                 rows.append({
-                    "sportsbook": str(book).lower().replace(" ", "_")[:30],
+                    "sportsbook": book_key,
                     "home_ml": home_ml_f,
                     "away_ml": away_ml_f,
+                    "is_closing": True,
                 })
+
+            # Opening moneyline
+            opening = entry.get("openingLine", {})
+            if opening:
+                open_home = opening.get("homeOdds")
+                open_away = opening.get("awayOdds")
+                if open_home is not None and open_away is not None:
+                    rows.append({
+                        "sportsbook": book_key,
+                        "home_ml": max(min(float(open_home), 99999), -99999),
+                        "away_ml": max(min(float(open_away), 99999), -99999),
+                        "is_closing": False,
+                    })
 
     return rows
 
@@ -230,15 +246,16 @@ def scrape_date(sport_key, dt):
 
         matched += 1
 
-        # Extract moneyline odds
+        # Extract moneyline odds (closing + opening)
         ml_odds = extract_moneyline_odds(game)
         for ml in ml_odds:
+            is_close = ml.get("is_closing", True)
             home_imp, away_imp = devig_american(ml["home_ml"], ml["away_ml"])
             all_rows.append((
                 game_id, ml["sportsbook"], "moneyline",
                 ml["home_ml"], ml["away_ml"], None,
                 None, None,
-                home_imp, away_imp, True,
+                home_imp, away_imp, is_close,
             ))
 
     # Fetch totals page
@@ -266,6 +283,9 @@ def scrape_date(sport_key, dt):
                     if entry is None:
                         continue
                     book = entry.get("sportsbook", "unknown")
+                    book_key = str(book).lower().replace(" ", "_")[:30]
+
+                    # Closing line
                     current = entry.get("currentLine", {})
                     if current is None:
                         continue
@@ -276,11 +296,27 @@ def scrape_date(sport_key, dt):
                         ov = max(min(float(over_odds_val), 99999), -99999) if over_odds_val else None
                         un = max(min(float(under_odds_val), 99999), -99999) if under_odds_val else None
                         all_rows.append((
-                            game_id, str(book).lower().replace(" ", "_")[:30], "total",
+                            game_id, book_key, "total",
                             None, None, float(total),
                             ov, un,
                             None, None, True,
                         ))
+
+                    # Opening line (stored as is_closing=false)
+                    opening = entry.get("openingLine", {})
+                    if opening:
+                        open_total = opening.get("total")
+                        open_over = opening.get("overOdds")
+                        open_under = opening.get("underOdds")
+                        if open_total is not None:
+                            o_ov = max(min(float(open_over), 99999), -99999) if open_over else None
+                            o_un = max(min(float(open_under), 99999), -99999) if open_under else None
+                            all_rows.append((
+                                game_id, book_key, "total",
+                                None, None, float(open_total),
+                                o_ov, o_un,
+                                None, None, False,
+                            ))
 
             # Handle dict format (older data)
             elif isinstance(odds, dict):

@@ -1,0 +1,36 @@
+name: Underdog Props Capture
+
+# Snapshot Underdog Fantasy MLB player prop lines throughout the day.
+# Inserts into underdog_props table. Captures line movement leading up
+# to game time for CLV measurement.
+#
+# Schedule: more captures on weekends (more games, earlier starts).
+
+on:
+  schedule:
+    # Weekdays (Mon-Fri, day-of-week 1-5)
+    - cron: '0 15 * * 1-5'   # 11:00 AM ET — opening lines
+    - cron: '0 19 * * 1-5'   # 3:00 PM ET — mid-day movement
+    - cron: '0 22 * * 1-5'   # 6:00 PM ET — pre-night games
+    # Weekends (Sun=0, Sat=6)
+    - cron: '0 14 * * 0,6'   # 10:00 AM ET — opening lines
+    - cron: '30 16 * * 0,6'  # 12:30 PM ET — pre day games
+    - cron: '0 20 * * 0,6'   # 4:00 PM ET — afternoon
+    - cron: '0 22 * * 0,6'   # 6:00 PM ET — pre-night games
+  workflow_dispatch:  # Manual trigger
+
+jobs:
+  capture:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+      - run: pip install -r requirements.txt
+      - name: Capture Underdog props
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python -m scrapers.props.underdog

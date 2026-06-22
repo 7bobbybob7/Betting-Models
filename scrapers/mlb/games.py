@@ -293,12 +293,14 @@ def pull_game_info(sport_id, year):
     """
     season_id = ensure_season(sport_id, year)
 
-    # Find games without mlb_game_info
+    # Find games without mlb_game_info OR missing wind_dir/umpire
     games_without_info = query("""
         SELECT g.game_id, g.external_id
         FROM games g
         LEFT JOIN mlb_game_info gi ON g.game_id = gi.game_id
-        WHERE g.sport_id = %s AND g.season_id = %s AND gi.game_id IS NULL
+        WHERE g.sport_id = %s AND g.season_id = %s
+          AND (gi.game_id IS NULL OR gi.weather_dir IS NULL OR gi.umpire_hp IS NULL)
+          AND g.status = 'final'
     """, [sport_id, season_id])
 
     if len(games_without_info) == 0:
@@ -351,11 +353,13 @@ def pull_game_info(sport_id, year):
         except Exception:
             pass
 
-        # Weather info (not always available)
+        # Weather + umpire info (not always available)
         game_info = boxscore.get("gameBoxInfo", [])
         weather_temp = None
         weather_wind = None
+        weather_dir = None
         weather_cond = None
+        umpire_hp = None
 
         for info in game_info:
             label = info.get("label", "")
@@ -371,9 +375,21 @@ def pull_game_info(sport_id, year):
                 except Exception:
                     pass
             elif label == "Wind":
+                # Parse "8 mph, Out To CF" or "12 mph, In From LF"
                 try:
                     wind_str = value.split()[0]
                     weather_wind = int(wind_str)
+                    # Direction is everything after "mph, "
+                    if "," in value:
+                        weather_dir = value.split(",", 1)[1].strip().lower()
+                except Exception:
+                    pass
+            elif label == "Umpires":
+                # Parse "HP: Clint Vondrak. 1B: Brock Ballou. ..."
+                try:
+                    if "HP:" in value:
+                        hp_part = value.split("HP:")[1].split(".")[0].strip()
+                        umpire_hp = hp_part if hp_part else None
                 except Exception:
                     pass
 
@@ -381,11 +397,15 @@ def pull_game_info(sport_id, year):
         try:
             execute("""
                 INSERT INTO mlb_game_info (game_id, home_starter_id, away_starter_id,
-                    weather_temp, weather_wind, weather_cond)
-                VALUES (%s, %s, %s, %s, %s, %s)
-                ON CONFLICT (game_id) DO NOTHING
+                    weather_temp, weather_wind, weather_dir, weather_cond, umpire_hp)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (game_id) DO UPDATE SET
+                    weather_dir = COALESCE(EXCLUDED.weather_dir, mlb_game_info.weather_dir),
+                    umpire_hp = COALESCE(EXCLUDED.umpire_hp, mlb_game_info.umpire_hp),
+                    home_starter_id = COALESCE(EXCLUDED.home_starter_id, mlb_game_info.home_starter_id),
+                    away_starter_id = COALESCE(EXCLUDED.away_starter_id, mlb_game_info.away_starter_id)
             """, [game_id, home_starter_id, away_starter_id,
-                  weather_temp, weather_wind, weather_cond])
+                  weather_temp, weather_wind, weather_dir, weather_cond, umpire_hp])
             inserted += 1
         except Exception as e:
             continue

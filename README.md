@@ -1,177 +1,222 @@
-# Multi-Sport Betting Platform
+# MLB Hitter Prop Modeling Platform
 
-A predictive betting platform that generates fair-value probabilities across game outcomes, totals, and player prop markets. Built on 7.6M+ Statcast pitches, 25K+ MLB games, and 650K+ odds records across 27+ sportsbooks. Tracks decomposed CLV (closing line value) to separate model skill from line shopping value.
+A data + modeling pipeline for **MLB player prop betting** (Hits + Runs + RBIs,
+Total Bases, Hits, etc.) targeting Underdog Fantasy's adjusted-odds market.
 
-## Results
+Pulls Statcast pitch data, MLB box scores, and Underdog prop lines into
+Postgres on a daily schedule. Models are built per-player-game using
+matchup-aware features (batter vs pitch type, pitcher arsenal, lineup
+context, swing tendencies).
 
-| Model | Market | Key Metric | Notes |
-|-------|--------|-----------|-------|
-| Team-Level (LogReg) | Moneyline | +0.42% CLV, positive 6/6 seasons | Real signal, unprofitable after vig |
-| Pitcher K (Poisson) | Player Props | 1.83 MAE, calibration within 2% | No prop lines yet for CLV |
-| **Totals (Regression)** | **Over/Under** | **51.3% win, +0.3% ROI w/ line shopping** | **Live testing 2026** |
-| **Totals (Classifier)** | **Over/Under** | **51.1% win, +1.7% ROI w/ line shopping** | **Comparison model 2026** |
+## Why hitter props
 
-**Critical finding:** Without line shopping across 6+ sportsbooks, both strategies lose money. The model provides ~51.3% directional accuracy; profitability depends entirely on getting best-available odds.
+This project originally targeted MLB game totals. After 60 days of live
+deployment (April-June 2026), all three totals models were unprofitable
+(see [`archive/TOTALS_LIVE_TEST_FINDINGS.md`](archive/TOTALS_LIVE_TEST_FINDINGS.md)).
+The 2026 environment is structurally UNDER-favored, and our model echoed
+market consensus on direction selection — meaning we were betting the same
+side as the public and losing.
 
-## How It Works
+Hitter props on Underdog have three advantages over game totals:
+1. **Less efficient markets.** Books can't price ~250 hitters × 13 stat
+   types × 15 games per day with the same rigor as 15 game totals.
+2. **Explicit odds and payout multipliers in the API.** Underdog's API
+   returns `american_price`, `decimal_price`, and `payout_multiplier`
+   per side — no hidden combinatorial pricing like PrizePicks.
+3. **Matchup-driven outcomes.** Hitter performance against specific
+   pitcher arsenals is more model-tractable than game totals which are
+   already a sum of many noisy components.
 
-### 2-Step Betting Framework
+## Project status
 
-1. **Informational edge:** Multiplicative de-vig on median book odds gives the market consensus P(over). Model generates its own P(over). The gap is the info edge.
-2. **Execution edge:** If info edge exceeds threshold, line shop across all books for the best price. Only bet if model probability beats the breakeven at the best available odds.
-
-### CLV Decomposition
-
-Every bet is decomposed into two sources of value:
-- **Model CLV** — Did the market consensus move toward our position? (informational edge)
-- **Execution CLV** — Was our bet book softer than the consensus? (line shopping value)
-
-This answers the key question: is profit coming from the model being right, or from catching soft lines?
+| Component | Status |
+|-----------|--------|
+| MLB game/box score scraper | ✅ Running daily |
+| Statcast pitch data scraper | ✅ Running daily (caught up through current) |
+| Underdog props capture | ✅ Running 3x weekday / 4x weekend |
+| Hitter prop model | 🚧 Not yet built — next phase |
+| Live prop betting | ⏸️ Pending model |
 
 ## Architecture
 
 ```
-DATA LAYER                 MODEL LAYER                 OPERATIONS
-----------                 -----------                 ----------
-MLB Stats API ---+          ELO (starter-adjusted)      GitHub Actions (3 daily crons)
-pybaseball ------+          LogReg (moneyline)          Daily prediction pipeline
-Statcast --------+---> PG   LinearReg (totals)          SBR odds scraper (6 books)
-ESPN API --------+          LogReg L1 (classifier)      FastAPI backend (8 endpoints)
-SBR scraper -----+          Poisson (pitcher K)         Streamlit dashboard (6 tabs)
-nba_api ---------+          WNBA ELO + features         Backfill outcomes + CLV
+                       ┌──────────────────┐
+   MLB Stats API ───►  │ scrapers/mlb/    │ ──► games, box scores, weather, umpire
+                       └──────────────────┘
+                                │
+  Baseball Savant       ┌──────────────────┐
+   (pybaseball)   ───►  │ scrapers/mlb/    │ ──► mlb_pitches (pitch-by-pitch)
+                       │   statcast_daily │
+                       └──────────────────┘
+                                │
+                                ▼
+                       ┌──────────────────┐
+                       │  Postgres        │ ◄────── scrapers/props/underdog.py
+                       │  (Supabase)      │            (Underdog prop snapshots)
+                       └──────────────────┘
+                                │
+                                ▼
+                       ┌──────────────────┐
+                       │ models/mlb/      │ (planned)
+                       │  hitter prop     │ ──► predicted P(over) per prop line
+                       │  classifier      │ ──► EV vs Underdog odds
+                       └──────────────────┘
 ```
 
-## Data
-
-| Table | Rows | Description |
-|-------|------|-------------|
-| MLB Games | 25,800+ | 2015-2026 schedules and scores |
-| Statcast Pitches | 7.6M+ | Pitch-level data (velo, spin, movement, outcomes) |
-| Batting Stats | 600K+ | Per-player per-game batting lines |
-| Pitching Stats | 221K+ | Per-player per-game pitching lines |
-| Odds | 650K+ | Multi-book closing lines (2015-2026, 27+ sportsbooks) |
-| WNBA Games | 2,601 | 2015-2024 via ESPN + nba_api |
-| Predictions | 14K+ | All model predictions with outcomes, P&L, decomposed CLV |
-| CBB Games | 53K+ | College basketball (migrated from prior project) |
-
-## Models
-
-### MLB Moneyline (Phase 1-3)
-- Custom ELO with starter adjustments (pitcher quality shifts team ELO per game, K=6)
-- 113 features: pitcher, batting, bullpen, ELO, park factor, weather, lineup-specific
-- LogReg with L1 regularization outperforms XGBoost at high volume
-- +0.42% CLV across 6 seasons, but unprofitable after vig at any threshold
-
-### MLB Totals — Dual Model Live Test (Phase 4)
-Two approaches running in parallel for the 2026 season:
-
-**Regression (primary):** LinearRegression predicts total runs, converts to P(over) via normal CDF. Threshold: >=1% info edge + EV gate. ~1,500 bets/year, 51.3% win rate.
-
-**Classifier (comparison):** LogReg L1 directly classifies over/under using game features + market line. Threshold: >=3% info edge + EV gate. ~700 bets/year, 51.1% win rate but higher ROI via odds selection.
-
-Both use: multiplicative de-vig on median book, line shopping across 6+ books, $100 flat sizing, decomposed CLV tracking.
-
-### Pitcher K Props (Phase 2)
-- Poisson regression with Statcast features (whiff rate, chase rate, pitch mix, velocity)
-- 1.83 MAE, excellent calibration across all K ranges
-- No prop line data yet for CLV measurement
-
-### WNBA (Phase 5)
-- 2,601 games loaded (2015-2024), ELO trained (K=22, home_advantage=55)
-- Cross-validated totals: -2.1% ROI — thin-market thesis did not hold
-- Ready to wire into pipeline for May 2026 season start
-
-## Live Pipeline
-
-Runs automatically via GitHub Actions at three times daily:
-
-| Run | Time (ET) | Purpose |
-|-----|-----------|---------|
-| Backfill | 6:00 AM | Outcomes, edges, P&L, decomposed CLV for completed games |
-| Day games | 11:30 AM | Predictions for afternoon slate |
-| Night games | 6:30 PM | Predictions for evening slate |
-
-Pipeline steps:
-1. Pull new game results and box scores
-2. Scrape today's odds from SportsBookReview (6 books: bet365, DraftKings, FanDuel, BetMGM, Caesars, Fanatics)
-3. Build features and generate predictions (regression + classifier)
-4. De-vig median book, compute info edge, line shop for best price
-5. Flag bets meeting threshold criteria, log with bet_book and bet_odds
-6. Backfill: compute Model CLV + Execution CLV for resolved bets
-
-### Bankroll
-- $10,000 starting bankroll, $100 flat per flagged bet
-- One bet per game (deduped when both models flag the same game)
-- Per-model tracking for independent ROI/CLV comparison
-- Evaluation: October 2026 after regular season ends
-
-## Stack
-
-- **Database:** PostgreSQL (Supabase)
-- **Language:** Python 3.12
-- **ML:** scikit-learn, XGBoost, statsmodels, scipy
-- **Data:** MLB Stats API, pybaseball (Statcast), ESPN API, nba_api, SportsBookReview
-- **API:** FastAPI (8 endpoints)
-- **Dashboard:** Streamlit (6 tabs)
-- **Automation:** GitHub Actions (3 daily cron jobs)
-
-## Project Structure
+## Repo layout
 
 ```
-db/                  Schema, migrations, and database connection (SimpleConnectionPool)
-scrapers/
-  mlb/               Games, box scores, Statcast scrapers
-  wnba/              ESPN + nba_api scrapers
-  odds/              ESPN historical, Arnav dataset, SBR daily scraper
-models/
-  mlb/
-    features.py      113-column feature pipeline
-    elo.py           Starter-adjusted ELO system (K=6)
-    train.py         LogReg + XGBoost training
-    totals_model.py  Run totals regression
-    train_totals_classifier.py  Over/under classifier
-    k_model.py       Pitcher K Poisson model
-    hitter_model.py  Hitter prop models
-    lineup_features.py  Per-player lineup aggregation
-    statcast_features.py  Pitch-level feature engineering
-    threshold_backtest.py  Dual-approach threshold comparison
-  wnba/              ELO, features, training
-api/                 FastAPI backend (games, predictions, CLV, bankroll, calibration, health)
-dashboard/           Streamlit frontend (today, performance, P&L, predictions, calibration, health)
-scripts/
-  daily_pipeline.py  Main pipeline: scrape, predict, flag, log
-  backfill_outcomes.py  Outcomes, P&L, decomposed CLV
-  daily_refresh.py   Data refresh utilities
-.github/workflows/   GitHub Actions (3 daily cron runs)
+.
+├── README.md                 — This file
+├── archive/                  — Legacy totals/moneyline/WNBA work
+│   ├── LEGACY_PATHS.md       — Import-dependency map for reviving any archived file
+│   ├── TOTALS_LIVE_TEST_FINDINGS.md  — Why the totals models were retired
+│   └── ...                   — All legacy code preserved
+│
+├── docs/
+│   └── CLAUDE.md             — Project notes for AI assistants
+│
+├── db/
+│   ├── db.py                 — Postgres connection pool + helpers
+│   ├── schema.sql            — Full schema definition
+│   └── migrate_*.sql         — Schema additions over time
+│
+├── scrapers/
+│   ├── mlb/
+│   │   ├── games.py          — MLB Stats API: schedules + scores + game info
+│   │   ├── boxscores.py      — Per-batter and per-pitcher game stats
+│   │   ├── statcast.py       — Full-season Statcast pull (manual catchup)
+│   │   ├── statcast_daily.py — Yesterday's pitches only (daily cron)
+│   │   └── run_all.py        — Bootstrap helper for new clones
+│   └── props/
+│       └── underdog.py       — Underdog Fantasy MLB props snapshot capture
+│
+├── models/
+│   └── mlb/
+│       ├── statcast_features.py  — Pitcher Statcast features (whiff/chase/velo)
+│       ├── lineup_features.py    — Per-player lineup feature aggregation
+│       ├── k_model.py            — Pitcher strikeout Poisson model
+│       └── hitter_model.py       — Earlier hitter prop attempt (starting point)
+│
+├── scripts/
+│   └── daily_refresh.py      — Morning cron entry point
+│
+├── .github/workflows/
+│   ├── daily_pipeline.yml    — Morning: pulls games + box scores + Statcast
+│   └── underdog_capture.yml  — 3-4x daily: snapshots Underdog prop lines
+│
+├── config.py
+├── requirements.txt
+└── .env.example              — Set DATABASE_URL here
 ```
 
-## Setup
+## Data sources
 
-1. Clone the repo
-2. `pip install -r requirements.txt`
-3. Copy `.env.example` to `.env` and add your Supabase connection string
-4. Run `db/schema.sql` in Supabase SQL Editor
-5. Run scrapers to load data:
-   ```bash
-   python -m scrapers.mlb.run_all --start 2015 --end 2026
-   python -m scrapers.odds.espn_odds --sport mlb --start 2015 --end 2024
-   python -m models.mlb.features --start 2016 --end 2025
-   python -m models.mlb.train --save-models
-   python -m models.mlb.train_totals_classifier
-   ```
-6. Run the daily pipeline:
-   ```bash
-   python scripts/daily_pipeline.py
-   ```
-7. Start the dashboard:
-   ```bash
-   uvicorn api.app:app --port 8000 &
-   streamlit run dashboard/app.py
-   ```
+| Source | What it provides | Cost | Where it lands |
+|--------|-----------------|------|----------------|
+| MLB Stats API | Game schedules, scores, box scores, probable pitchers, weather, umpires | Free | `games`, `mlb_batting_game`, `mlb_pitching_game`, `mlb_game_info` |
+| Baseball Savant (via pybaseball) | Pitch-by-pitch Statcast: velocity, spin, location, xwOBA, launch angle | Free | `mlb_pitches` |
+| Underdog Fantasy API | Player prop lines: both sides' odds + multipliers | Free (no auth) | `underdog_props` |
 
-## Sports Roadmap
+## Database
 
-- **MLB** — Live (dual model test, decomposed CLV tracking)
-- **WNBA** — Next (season starts May 2026, data + models ready)
-- **CBB** — Data migrated, model from prior project
-- **NHL / NFL** — Schema stubbed, build when seasons approach
+- **Provider:** Supabase Postgres
+- **Plan:** Pro ($25/mo, planned downgrade to free after pre-aggregation phase)
+- **Current size:** ~2 GB (well under 8 GB Pro limit)
+- **Connection:** via `DATABASE_URL` env var, `psycopg2` connection pool in `db/db.py`
+
+Key tables:
+- `games` — every MLB game 2015–present (~26K rows)
+- `mlb_batting_game` — every batter × game outcome (H, R, RBI, etc.) (~600K rows)
+- `mlb_pitching_game` — every pitcher × game outcome (~220K rows)
+- `mlb_pitches` — pitch-by-pitch Statcast data (~7.6M rows, biggest table)
+- `mlb_game_info` — weather, umpire, probable pitchers
+- `underdog_props` — Underdog prop snapshots, multiple per day per line
+- `predictions` — model predictions log (currently inactive; was used by retired totals models)
+
+## Daily cron schedule
+
+All times in UTC. ET = UTC-4 during summer.
+
+| Cron | Workflow | What it does |
+|------|----------|--------------|
+| `0 10 * * *` (6 AM ET) | `daily_pipeline.yml` | Pulls yesterday's box scores + last 3 days of Statcast |
+| `0 15 * * 1-5` (11 AM ET, weekday) | `underdog_capture.yml` | Underdog opening-ish lines |
+| `0 19 * * 1-5` (3 PM ET, weekday) | `underdog_capture.yml` | Mid-day line movement |
+| `0 22 * * 1-5` (6 PM ET, weekday) | `underdog_capture.yml` | Pre-night-games |
+| `0 14 * * 0,6` (10 AM ET, weekend) | `underdog_capture.yml` | Opening lines |
+| `30 16 * * 0,6` (12:30 PM ET, weekend) | `underdog_capture.yml` | Pre-day-games |
+| `0 20 * * 0,6` (4 PM ET, weekend) | `underdog_capture.yml` | Mid-afternoon |
+| `0 22 * * 0,6` (6 PM ET, weekend) | `underdog_capture.yml` | Pre-night-games |
+
+## Setup (for a fresh clone)
+
+```bash
+# 1. Install
+pip install -r requirements.txt
+
+# 2. Env
+cp .env.example .env
+# Set DATABASE_URL to your Postgres connection string
+
+# 3. Schema
+psql $DATABASE_URL -f db/schema.sql
+psql $DATABASE_URL -f db/migrate_underdog_props.sql
+
+# 4. Bootstrap historical data (slow: hours)
+python -m scrapers.mlb.run_all --start 2015 --end 2026
+
+# 5. Pull Statcast (very slow: ~1 day, rate-limited)
+python -m scrapers.mlb.statcast --start 2015 --end 2026
+
+# 6. Verify
+python scripts/daily_refresh.py
+python -m scrapers.props.underdog
+```
+
+## Running a one-off capture
+
+```bash
+# Yesterday's MLB data only
+python scripts/daily_refresh.py
+
+# Last 3 days of Statcast (used by morning cron)
+python -m scrapers.mlb.statcast_daily --days 3
+
+# Snapshot current Underdog MLB props (writes to DB + optionally CSV)
+python -m scrapers.props.underdog
+python -m scrapers.props.underdog --csv-also  # also write CSV
+```
+
+## What's next (planned work)
+
+1. **Build batter arsenal profile features** from `mlb_pitches`:
+   - Pull rate, launch angle distribution per batter
+   - vs-pitch-type xwOBA (e.g. "Walker vs sinkers" .380, "Walker vs high fastballs" .290)
+   - Zone preferences and chase tendencies
+   - Stored as pre-computed lookup tables joined at predict time
+
+2. **Build pitcher arsenal profile features**:
+   - Pitch mix percentages (% sinker, % slider, etc.)
+   - Velocity / spin rate per pitch type
+   - Recent velo trend (last 3 starts vs season)
+
+3. **Train hitter prop model** targeting Hits + Runs + RBIs (HRR) over 1.5:
+   - Binary classifier with batter + pitcher + matchup + context features
+   - L1-regularized LogReg as baseline
+   - Expanding-window cross-validation across 2019–2025
+   - Direction-level metrics from day 1 (lesson learned from totals OVER bias)
+
+4. **Validate against actual outcomes** using `mlb_batting_game` (H/R/RBI per game).
+
+5. **Once Underdog snapshot dataset is large enough (~30 days):**
+   compute predicted P(over) vs actual closing line implied probability per prop,
+   measure CLV going forward.
+
+## Lessons from the totals work (preserved in `archive/`)
+
+- Backtest profitability does not guarantee live profitability
+- Aggregate calibration can hide systematic bet-selection bias
+- Decomposing performance by direction surfaces failure modes aggregate metrics miss
+- The "model echoes market consensus" failure mode is real and costs money
+- Live test data is the only valid validation

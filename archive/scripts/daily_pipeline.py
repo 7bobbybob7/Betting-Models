@@ -52,6 +52,7 @@ def get_todays_games(target_date):
         LEFT JOIN mlb_game_info gi ON g.game_id = gi.game_id
         WHERE g.sport_id = 2 AND g.game_date = %s
           AND g.status IN ('scheduled', 'pre_game')
+          AND g.is_postseason = false
     """, [dt_str])
     return games
 
