@@ -21,20 +21,19 @@ After archiving, the file is one directory deeper, so this needs to become:
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../../.."))
 ```
 
-After fixing the sys.path, all `from db.db import ...`, `from scrapers... import ...`,
-and `from models.mlb... import ...` calls work because:
+After fixing the sys.path, all `from db.db import ...` and
+`from scrapers... import ...` calls work because:
 - `db/` and `scrapers/mlb/`, `scrapers/props/` are still in the repo root
-- `models/mlb/statcast_features.py`, `lineup_features.py`, `k_model.py`,
-  `hitter_model.py` are still in their original location (we kept them as
-  reusable infrastructure)
 
-For files that import other archived files (e.g. `archive/models/totals/features.py`
-importing `models.mlb.elo`), the import line must be updated:
+All `from models.mlb... import ...` calls now need to be rewritten — every
+model file from the totals era has been archived. For example:
 ```python
 # OLD:
 from models.mlb.elo import MLBElo
+from models.mlb.statcast_features import build_statcast_features
 # NEW:
 from archive.models.totals.elo import MLBElo
+from archive.models.mlb.statcast_features import build_statcast_features
 ```
 
 ---
@@ -57,12 +56,30 @@ All three deployed totals models proved unprofitable in live testing.
 | `models/mlb/totals_model.py` | `archive/models/totals/totals_model.py` | `db.db` | None — trains and saves `totals_model.pkl` |
 | `models/mlb/totals_classifier.py` | `archive/models/totals/totals_classifier.py` | `db.db` | None — analysis script |
 | `models/mlb/train_totals_classifier.py` | `archive/models/totals/train_totals_classifier.py` | `db.db` | None — trains and saves `totals_classifier.pkl` |
-| `models/mlb/totals_v2.py` | `archive/models/totals/totals_v2.py` | `db.db`, `models.mlb.statcast_features`, `models.mlb.lineup_features` | None |
+| `models/mlb/totals_v2.py` | `archive/models/totals/totals_v2.py` | `db.db`, `archive.models.mlb.statcast_features`, `archive.models.mlb.lineup_features` | None |
 | `models/mlb/totals_v3.py` | `archive/models/totals/totals_v3.py` | `db.db` | None |
 | `models/mlb/totals_rolling_retrain.py` | `archive/models/totals/totals_rolling_retrain.py` | `db.db` | None |
 | `models/mlb/totals_line_shopping.py` | `archive/models/totals/totals_line_shopping.py` | `db.db` | None |
-| `models/mlb/ip_model.py` | `archive/models/totals/ip_model.py` | `db.db`, `models.mlb.statcast_features` | None |
+| `models/mlb/ip_model.py` | `archive/models/totals/ip_model.py` | `db.db`, `archive.models.mlb.statcast_features` | None |
 | `models/mlb/player_model.py` | `archive/models/totals/player_model.py` | `db.db`, `models.mlb.train` (archived) | None |
+
+### archive/models/mlb/
+
+Models that lived in `models/mlb/` during the totals era — kept around as
+"reusable infrastructure" but they were all built for totals/K context, not
+hitter props. Archived June 22, 2026 when the active model directory was
+reset for the hitter prop rebuild.
+
+Their saved `.pkl` bundles moved alongside them to `archive/models/mlb/saved/`.
+
+| Original path | Archive path | Original purpose | Why archived |
+|---------------|--------------|------------------|--------------|
+| `models/mlb/hitter_model.py` | `archive/models/mlb/hitter_model.py` | Early Poisson hitter prop model (hits/TB/HR) | No matchup features, no HRR target, never deployed live |
+| `models/mlb/statcast_features.py` | `archive/models/mlb/statcast_features.py` | Pitcher Statcast aggregation (whiff%, velo, pitch mix) — for the K model | Built for K prop, not hitter prop matchup features |
+| `models/mlb/lineup_features.py` | `archive/models/mlb/lineup_features.py` | Lineup-aggregated batter features for the player-level totals model | Totals-era infrastructure; hitter props are per-player not aggregated |
+| `models/mlb/k_model.py` | `archive/models/mlb/k_model.py` | Pitcher strikeout Poisson model | Totals-era; not a hitter prop |
+| `models/mlb/saved/hitter_*.pkl` | `archive/models/mlb/saved/hitter_*.pkl` | Trained hitter_model bundles | Tied to archived hitter_model.py |
+| `models/mlb/saved/k_poisson.pkl` | `archive/models/mlb/saved/k_poisson.pkl` | Trained k_model bundle | Tied to archived k_model.py |
 
 ### archive/models/investigations/
 
@@ -151,9 +168,8 @@ Old project documentation that referenced the totals direction.
 
 ## Active code that legacy depends on (DO NOT MOVE)
 
-These files are still in their original location because hitter prop work
-will use them too. Archived files that reference them keep working as long as
-sys.path is fixed.
+These files are still in their original location. Archived files that
+reference them keep working as long as sys.path is fixed.
 
 | Path | What it provides |
 |------|------------------|
@@ -163,11 +179,11 @@ sys.path is fixed.
 | `scrapers/mlb/statcast.py` | Full-season Statcast loader |
 | `scrapers/mlb/statcast_daily.py` | Daily Statcast pull (cron) |
 | `scrapers/props/underdog.py` | Underdog props capture (cron) |
+| `scrapers/props/bettingpros.py` | BettingPros historical props (backfill + cron) |
 | `scripts/daily_refresh.py` | Morning data refresh (cron) |
-| `models/mlb/statcast_features.py` | Reusable Statcast feature engineering |
-| `models/mlb/lineup_features.py` | Reusable lineup feature engineering |
-| `models/mlb/k_model.py` | Pitcher K Poisson model (will use for hitter prop pitcher features) |
-| `models/mlb/hitter_model.py` | Earlier hitter prop attempt (starting point) |
+
+The active `models/mlb/` directory is currently empty — fresh hitter prop
+features and v1 model will land there.
 
 ## Reviving an archived workflow
 
@@ -188,8 +204,10 @@ If you ever want to run an archived script:
    - It imports `from models.mlb.features import build_feature_matrix` which
      is now at `archive/models/totals/features.py` — update to
      `from archive.models.totals.features import build_feature_matrix`.
-   - `from models.mlb.statcast_features import build_statcast_features` still
-     works because `statcast_features.py` is still in `models/mlb/`.
+   - `from models.mlb.statcast_features import build_statcast_features` now
+     needs to be rewritten as
+     `from archive.models.mlb.statcast_features import build_statcast_features`
+     (file moved to archive June 22, 2026).
 
 4. **For the old api/dashboard:**
    - `api/app.py` only imports `db.db` so it works as-is after sys.path fix.
