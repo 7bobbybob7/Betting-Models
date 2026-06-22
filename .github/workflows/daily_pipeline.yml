@@ -35,3 +35,8 @@ jobs:
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: python -m scrapers.mlb.statcast_daily --days 3
+
+      - name: Backfill handedness for any new players (rookies, call-ups)
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python -m scrapers.mlb.backfill_player_handedness --new-only

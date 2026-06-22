@@ -103,6 +103,7 @@ def pull_boxscore(sport_id, game_id, game_pk, home_team_id, away_team_id):
                 _safe_int(batter.get("hbp")),
                 _safe_int(batter.get("sb")),
                 _safe_int(batter.get("cs")),
+                _safe_int(batter.get("r")),  # runs scored — required for HRR label
             ))
 
         # --- Pitching ---
@@ -165,7 +166,7 @@ def pull_boxscore(sport_id, game_id, game_pk, home_team_id, away_team_id):
         batting_cols = [
             "game_id", "player_id", "team_id", "batting_order",
             "pa", "ab", "hits", "doubles", "triples", "hr", "rbi",
-            "bb", "so", "hbp", "sb", "cs"
+            "bb", "so", "hbp", "sb", "cs", "runs"
         ]
         _bulk_insert_safe("mlb_batting_game", batting_cols, batting_data)
 
