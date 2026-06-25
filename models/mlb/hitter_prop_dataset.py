@@ -164,8 +164,12 @@ def build_dataset(start_date: date, end_date: date) -> pd.DataFrame:
     identity_cols = ['player_id', 'batter_name', 'game_id', 'game_date',
                      'opposing_starter_id', 'bat_hand', 'pit_throws',
                      'batter_team_id', 'batting_order']
+    # bat_hand / pit_throws match the bat_/pit_ prefix but are identity metadata, not
+    # model features — exclude them here so they don't duplicate identity_cols (parquet
+    # rejects duplicate column names).
     feature_cols  = [c for c in out.columns
-                     if c.startswith(('bat_', 'pit_', 'ctx_', 'mu_'))]
+                     if c.startswith(('bat_', 'pit_', 'ctx_', 'mu_'))
+                     and c not in identity_cols]
     label_cols    = ['lbl_hits', 'lbl_runs', 'lbl_rbi', 'lbl_tb', 'lbl_hrr',
                      'lbl_hrr_over_15', 'lbl_tb_over_15', 'lbl_rbi_over_05',
                      'lbl_hrr_valid']
@@ -174,7 +178,9 @@ def build_dataset(start_date: date, end_date: date) -> pd.DataFrame:
     out['lbl_runs'] = out['runs']
     out['lbl_rbi']  = out['rbi']
     keep = identity_cols + feature_cols + label_cols
-    keep = [c for c in keep if c in out.columns]
+    # De-dup while preserving order (defensive — any accidental overlap collapses to one)
+    seen = set()
+    keep = [c for c in keep if c in out.columns and not (c in seen or seen.add(c))]
 
     out = out[keep]
     print(f"[dataset] done: {out.shape[0]:,} rows x {out.shape[1]} cols "

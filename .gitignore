@@ -7,6 +7,10 @@ __pycache__/
 .DS_Store
 *.json
 data/
+# Derived/regenerable ML artifacts — rebuilt by hitter_prop_dataset.py / hitter_prop_model.py
+models/mlb/cache/
+models/mlb/saved/*.pkl
+*.parquet
 CLAUDE.md
 SESSION_SUMMARY.md
 PRD.md
