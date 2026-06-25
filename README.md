@@ -1,12 +1,34 @@
-# MLB Hitter Prop Modeling Platform
+# MLB Player Prop Betting Platform
 
 A data + modeling pipeline for **MLB player prop betting** (Hits + Runs + RBIs,
 Total Bases, Hits, etc.) targeting Underdog Fantasy's adjusted-odds market.
 
-Pulls Statcast pitch data, MLB box scores, and Underdog prop lines into
-Postgres on a daily schedule. Models are built per-player-game using
-matchup-aware features (batter vs pitch type, pitcher arsenal, lineup
-context, swing tendencies).
+Pulls Statcast pitch data, MLB box scores, and prop lines from multiple books
+into Postgres on a daily schedule. Both strategies below ultimately produce the
+same thing — a **`P_true` estimate** that, when it beats the price Underdog
+offers, makes a **positive-EV bet**.
+
+## Two strategies for finding +EV
+
+The platform pursues two complementary paths to a profitable edge. They differ
+only in *where the "true" probability comes from*:
+
+1. **Own predictive model** (`models/mlb/`) — build `P_true` ourselves from
+   matchup-aware features (batter vs pitch type, pitcher arsenal, lineup
+   context, swing tendencies). Hardest path: it requires out-forecasting the
+   market. In active development + validation.
+
+2. **+EV line-shopping / sharp-vs-soft** (`models/mlb/line_shopping.py`) — let a
+   **sharp book be the model**. Take Novig's de-vigged exchange price as fair
+   value and bet Underdog (a softer DFS book) wherever its line lags. This is the
+   textbook +EV-betting approach used by tools like OddsJam/Outlier/Unabated, and
+   our backtest shows **genuine potential edge**: ROI rises monotonically with the
+   size of the Novig-vs-Underdog discrepancy — the mechanical signature of a real
+   edge, concentrated in large gaps and lower-volume markets. Now being validated
+   forward with live dual-book capture (see [Sharp-vs-soft line shopping](#sharp-vs-soft-line-shopping-ev)).
+
+Both feed one betting system; the model and the sharp reference can also be
+combined (e.g. blended fair value, or each used to confirm the other).
 
 ## Why hitter props
 
@@ -29,58 +51,64 @@ Hitter props on Underdog have three advantages over game totals:
 
 ## Project status
 
+**Data layer**
+
 | Component | Status |
 |-----------|--------|
-| MLB game/box score scraper | ✅ Running daily (now captures runs scored) |
+| MLB game/box score scraper | ✅ Running daily (captures runs scored) |
 | Statcast pitch data scraper | ✅ Running daily (caught up through current) |
-| Player handedness (`bats`/`throws`) | ✅ Backfilled (4,160 players); cron refresh for rookies |
-| Underdog props capture | ✅ Running 3x weekday / 4x weekend |
-| BettingPros historical props (Underdog book_id=36) | ✅ 2026 done, 2024/2025 backfilling |
-| `mlb_batting_game.runs` column | ✅ Schema added; historical backfill in progress (~20%) |
-| Batter arsenal features | ✅ `models/mlb/batter_arsenal_features.py` (36 features) |
-| Pitcher arsenal features (handedness-conditioned mix) | ✅ `models/mlb/pitcher_arsenal_features.py` (45) |
-| Context features (rolling park factors, lineup support) | ✅ `models/mlb/context_features.py` (11) |
-| Matchup features (weighted xwOBA / whiff / platoon / PA) | ✅ `models/mlb/matchup_features.py` (6) |
-| Dataset assembler | ✅ `models/mlb/hitter_prop_dataset.py` (112 features + 3 labels) |
-| Hitter prop training script | 🚧 Next step (LR-L1 + LightGBM, expanding-season CV) |
-| Backtest script (EV threshold sweep) | 🚧 Pending |
-| Live prop betting | ⏸️ Pending model |
+| Player handedness + full names | ✅ Backfilled (4,160 players); cron refresh for rookies |
+| Underdog props capture (soft book) | ✅ Running 3x weekday / 4x weekend |
+| Novig exchange capture (sharp book, direct GraphQL) | ✅ Running same ticks as Underdog |
+| BettingPros historical props (Underdog 36 + Novig 60) | ✅ Backfilled 2024–2026 |
+| `mlb_batting_game.runs` column | ✅ Schema + historical backfill complete (100%) |
+
+**Strategy 1 — own predictive model**
+
+| Component | Status |
+|-----------|--------|
+| Feature stack (batter/pitcher/context/matchup) | ✅ 112 features, 4 modules, leak-safe |
+| Dataset assembler | ✅ `models/mlb/hitter_prop_dataset.py` (+ parquet cache) |
+| Training (LR-L1 + XGBoost, isotonic calibration, expanding-season CV) | ✅ `models/mlb/hitter_prop_model.py` |
+| Backtest (EV threshold sweep vs Underdog odds) | ✅ `models/mlb/backtest.py` |
+| Model tuning + live deployment | 🚧 In validation |
+
+**Strategy 2 — +EV line-shopping (sharp-vs-soft)**
+
+| Component | Status |
+|-----------|--------|
+| Novig vs Underdog discrepancy backtest | ✅ `models/mlb/line_shopping.py` — shows potential edge |
+| Live dual-book capture (Novig + Underdog, aligned ticks) | ✅ Running |
+| Forward paper-trade harness (persistence + OOS ROI) | 🚧 Next |
+| Live betting | ⏸️ Pending forward validation |
 
 ## Architecture
 
 ```
    MLB Stats API ───►  scrapers/mlb/games.py + boxscores.py  ──► games, mlb_batting_game,
                                                                   mlb_pitching_game, players
-                                                                          │
-   Baseball Savant ──► scrapers/mlb/statcast.py + statcast_daily.py ──► mlb_pitches
-                                                                          │
-   Underdog API   ───► scrapers/props/underdog.py             ──► underdog_props (forward only)
-                                                                          │
-   BettingPros API ──► scrapers/props/bettingpros.py          ──► bettingpros_props
-                                                                  (backfill + daily;
-                                                                   includes Underdog odds via book_id=36)
+   Baseball Savant ──► scrapers/mlb/statcast*.py             ──► mlb_pitches
+   Underdog API   ───► scrapers/props/underdog.py            ──► underdog_props   (soft book, live)
+   Novig GraphQL  ───► scrapers/props/novig.py               ──► novig_snapshots  (sharp book, live)
+   BettingPros API ──► scrapers/props/bettingpros.py         ──► bettingpros_props (Underdog 36 + Novig 60, history)
                                                                           │
                                                                           ▼
-                              Postgres on Supabase
-                                       │
-        ┌──────────────────────────────┼──────────────────────────────┐
-        │                              │                              │
-        ▼                              ▼                              ▼
-   models/mlb/                    models/mlb/                    models/mlb/
-   batter_arsenal_features.py     pitcher_arsenal_features.py   context_features.py
-   (36 features: per-pitch xwOBA, (45: handedness-conditioned   (11: rolling 365D park
-    whiff, plate discipline,       pitch mix, velo, allowed     factors, weather, lineup
-    handedness, recent form)       rates, IP/start)              OBP-in-front, SLG-behind)
-        │                              │                              │
-        └──────────┬───────────────────┴────────────┬─────────────────┘
-                   ▼                                ▼
-            models/mlb/matchup_features.py    models/mlb/hitter_prop_dataset.py
-            (6: weighted xwOBA, weighted       (orchestrates all 4 → 112 features
-             whiff, platoon, PA estimates)      + HRR/TB/RBI binary labels)
-                                                       │
-                                                       ▼
-                                  models/mlb/hitter_prop_model.py  (planned)
-                                  models/mlb/backtest.py           (planned)
+                                                  Postgres on Supabase
+                                                          │
+                  ┌───────────────────────────────────────┴───────────────────────────────┐
+                  ▼                                                                          ▼
+   STRATEGY 1 — own model                                            STRATEGY 2 — +EV line-shopping
+   ────────────────────────                                          ──────────────────────────────
+   batter_/pitcher_/context_/matchup_features.py                     models/mlb/line_shopping.py
+        │  (112 leak-safe features)                                       │  Novig de-vigged fair price
+        ▼                                                                 ▼  vs Underdog offered odds
+   hitter_prop_dataset.py  ──►  hitter_prop_model.py  ──► backtest.py     bet where the soft book lags
+   (assemble + label)           (LR-L1 + XGBoost,        (EV sweep        (ROI rises with discrepancy)
+                                 isotonic calibration)    vs Underdog)          │
+        │                                                                       ▼
+        └────────────────────────────┬──────────────────────────────►  forward paper-trade harness
+                                      ▼                                   (persistence + OOS ROI; planned)
+                           one betting system / EV gate
 ```
 
 ## Repo layout
@@ -108,28 +136,36 @@ Hitter props on Underdog have three advantages over game totals:
 │   │   ├── statcast.py                    — Full-season Statcast pull (manual catchup)
 │   │   ├── statcast_daily.py              — Last 3 days of pitches (daily cron)
 │   │   ├── backfill_player_handedness.py  — Fetch bats/throws via /api/v1/people
+│   │   ├── backfill_player_fullname.py    — Fetch canonical full names (cross-book matching)
 │   │   ├── backfill_batter_runs.py        — Backfill runs scored (re-fetches box scores)
 │   │   └── run_all.py                     — Bootstrap helper for new clones
 │   └── props/
-│       ├── underdog.py       — Underdog Fantasy MLB props snapshot capture (incl. batter walks)
-│       └── bettingpros.py    — BettingPros historical/daily props (Underdog odds via book_id=36)
+│       ├── underdog.py       — Underdog Fantasy MLB props capture (soft book; incl. batter walks)
+│       ├── novig.py          — Novig exchange capture (sharp book; direct GraphQL, de-vigged prices)
+│       └── bettingpros.py    — BettingPros historical/daily props (Underdog=36, Novig=60)
 │
 ├── models/
 │   └── mlb/
+│       │  # Strategy 1 — own predictive model
 │       ├── batter_arsenal_features.py    — 36 batter features (per pitch type + buckets)
 │       ├── pitcher_arsenal_features.py   — 45 pitcher features (mix conditioned on batter hand)
 │       ├── context_features.py           — 11 context features (rolling 365D park factors,
 │       │                                   weather, lineup OBP-in-front, SLG-behind)
 │       ├── matchup_features.py           — 6 cross-features (handedness-aware weighted xwOBA)
-│       └── hitter_prop_dataset.py        — Assembler: 112 features + HRR/TB/RBI labels
+│       ├── hitter_prop_dataset.py        — Assembler: 112 features + HRR/TB/RBI labels
+│       ├── hitter_prop_model.py          — Train LR-L1 + XGBoost, isotonic calibration, CV
+│       ├── backtest.py                   — Model EV sweep vs Underdog odds
+│       ├── cache/                        — Cached feature parquets (train / backtest splits)
+│       │  # Strategy 2 — +EV line-shopping
+│       └── line_shopping.py              — Novig-vs-Underdog discrepancy backtest (sharp-vs-soft)
 │                                            (totals-era models live in archive/models/mlb/)
 │
 ├── scripts/
 │   └── daily_refresh.py      — Morning cron entry point
 │
 ├── .github/workflows/
-│   ├── daily_pipeline.yml    — Morning: pulls games + box scores + Statcast
-│   └── underdog_capture.yml  — 3-4x daily: snapshots Underdog prop lines
+│   ├── daily_pipeline.yml    — Morning: games + box scores + Statcast + handedness refresh
+│   └── underdog_capture.yml  — 3-4x daily: snapshots BOTH Underdog + Novig prop lines
 │
 ├── config.py
 ├── requirements.txt
@@ -142,8 +178,9 @@ Hitter props on Underdog have three advantages over game totals:
 |--------|-----------------|------|----------------|
 | MLB Stats API | Schedules, scores, box scores, probable pitchers, weather, umpires, player handedness | Free | `games`, `mlb_batting_game` (incl. runs), `mlb_pitching_game`, `mlb_game_info`, `players` |
 | Baseball Savant (via pybaseball) | Pitch-by-pitch Statcast: velocity, spin, location, xwOBA, launch angle | Free | `mlb_pitches` |
-| Underdog Fantasy API | Live prop lines: both sides' odds + payout multipliers (incl. batter walks) | Free (no auth) | `underdog_props` |
-| BettingPros API (`/v3/props`) | Historical prop lines + outcomes; per-book filter so we get the actual Underdog book back to 2024 | Free (no auth) | `bettingpros_props` (book_id=36 for Underdog) |
+| Underdog Fantasy API | Live prop lines (soft book): both sides' odds + payout multipliers (incl. batter walks) | Free (no auth) | `underdog_props` |
+| Novig GraphQL API (`/v1/graphql`) | Live exchange prices (sharp book): de-vigged probabilities + order book + volume | Free (no auth) | `novig_snapshots` |
+| BettingPros API (`/v3/props`) | Historical prop lines + outcomes; per-book filter (Underdog=36, Novig=60) back to 2024 | Free (no auth) | `bettingpros_props` |
 
 ## Database
 
@@ -158,25 +195,29 @@ Key tables:
 - `mlb_pitching_game` — every pitcher × game outcome (~220K rows)
 - `mlb_pitches` — pitch-by-pitch Statcast data (~7.9M rows, biggest table)
 - `mlb_game_info` — weather, umpire, probable pitchers
-- `players` — 4,160 MLB players with `bats` and `throws` populated
-- `underdog_props` — Underdog prop snapshots, multiple per day per line (forward capture)
-- `bettingpros_props` — historical props for Underdog (book_id=36) + Consensus + Novig, back to Apr 2024
+- `players` — 4,160 MLB players with `bats`, `throws`, and `full_name` populated
+- `underdog_props` — Underdog (soft book) prop snapshots, multiple per day per line (forward capture)
+- `novig_snapshots` — Novig (sharp book) exchange snapshots: de-vigged last/available prices + volume, intraday
+- `bettingpros_props` — historical props for Underdog (36) + Consensus (0) + Novig (60), back to Apr 2024
 - `predictions` — model predictions log (currently inactive; was used by retired totals models)
 
 ## Daily cron schedule
 
 All times in UTC. ET = UTC-4 during summer.
 
+Each `underdog_capture.yml` tick now snapshots **both** Underdog and Novig at the
+same timestamp, so discrepancies can be compared time-aligned.
+
 | Cron | Workflow | What it does |
 |------|----------|--------------|
 | `0 10 * * *` (6 AM ET) | `daily_pipeline.yml` | Box scores + Statcast (last 3 days) + handedness backfill for new players |
-| `0 15 * * 1-5` (11 AM ET, weekday) | `underdog_capture.yml` | Underdog opening-ish lines |
-| `0 19 * * 1-5` (3 PM ET, weekday) | `underdog_capture.yml` | Mid-day line movement |
-| `0 22 * * 1-5` (6 PM ET, weekday) | `underdog_capture.yml` | Pre-night-games |
-| `0 14 * * 0,6` (10 AM ET, weekend) | `underdog_capture.yml` | Opening lines |
-| `30 16 * * 0,6` (12:30 PM ET, weekend) | `underdog_capture.yml` | Pre-day-games |
-| `0 20 * * 0,6` (4 PM ET, weekend) | `underdog_capture.yml` | Mid-afternoon |
-| `0 22 * * 0,6` (6 PM ET, weekend) | `underdog_capture.yml` | Pre-night-games |
+| `0 15 * * 1-5` (11 AM ET, weekday) | `underdog_capture.yml` | Underdog + Novig — opening-ish lines |
+| `0 19 * * 1-5` (3 PM ET, weekday) | `underdog_capture.yml` | Underdog + Novig — mid-day movement |
+| `0 22 * * 1-5` (6 PM ET, weekday) | `underdog_capture.yml` | Underdog + Novig — pre-night-games |
+| `0 14 * * 0,6` (10 AM ET, weekend) | `underdog_capture.yml` | Underdog + Novig — opening lines |
+| `30 16 * * 0,6` (12:30 PM ET, weekend) | `underdog_capture.yml` | Underdog + Novig — pre-day-games |
+| `0 20 * * 0,6` (4 PM ET, weekend) | `underdog_capture.yml` | Underdog + Novig — mid-afternoon |
+| `0 22 * * 0,6` (6 PM ET, weekend) | `underdog_capture.yml` | Underdog + Novig — pre-night-games |
 
 ## Setup (for a fresh clone)
 
@@ -221,9 +262,13 @@ python scripts/daily_refresh.py
 # Last 3 days of Statcast (used by morning cron)
 python -m scrapers.mlb.statcast_daily --days 3
 
-# Snapshot current Underdog MLB props (writes to DB + optionally CSV)
+# Snapshot current Underdog MLB props (soft book; writes to DB + optionally CSV)
 python -m scrapers.props.underdog
 python -m scrapers.props.underdog --csv-also
+
+# Snapshot current Novig exchange prices (sharp book; direct GraphQL)
+python -m scrapers.props.novig
+python -m scrapers.props.novig --dry-run   # print summary, no DB write
 
 # BettingPros: pull today, a single date, or a backfill range
 python -m scrapers.props.bettingpros                       # today, all default books
@@ -272,7 +317,10 @@ they validate the same feature stack against more sample.
 
 **Models** — train both side-by-side, choose by validation calibration + ROI:
 1. L1-regularized logistic regression (baseline, auto-sparsifies)
-2. LightGBM (captures nonlinear interactions)
+2. XGBoost (captures nonlinear interactions)
+
+Both get an **isotonic calibration** layer fit on a held-out latest season, so the
+probabilities fed to the EV gate are honest (no high-confidence overconfidence).
 
 **Cross-validation:**
 - Expanding by season for hyperparameter selection (train ≤2023 / val 2024 across folds)
@@ -283,16 +331,59 @@ they validate the same feature stack against more sample.
 one with the best risk-adjusted return (Sharpe-like: mean ROI / std ROI). Expectation is
 that frequent low-edge bets compound better than rare high-edge ones.
 
+## Sharp-vs-soft line shopping (+EV)
+
+The second strategy needs no predictive model of our own — it lets the **sharp
+market be the model**:
+
+1. Take **Novig**'s exchange price as fair value. Novig is a no-vig exchange, so its
+   two sides already sum to ~1.0 — a clean `P_true` with no margin to strip.
+2. Compare to **Underdog**'s offered odds on the same prop. Underdog is a
+   recreational DFS book; its lines are structurally slower/softer.
+3. When Novig's fair probability implies Underdog's price is off by more than
+   Underdog's built-in margin, that side is **+EV** — bet it.
+
+**Backtest signal (encouraging).** Across ~84k overlapping props (2024–2026), ROI
+rises **monotonically** with the size of the Novig-vs-Underdog discrepancy:
+small gaps lose to the vig, but large gaps (≥10%) turn positive, and the edge is
+strongest in lower-volume markets books price less carefully (HR, steals). A
+monotonic edge-vs-discrepancy curve is the mechanical fingerprint of a *real*
+edge rather than noise.
+
+```bash
+# Backtest: bet Underdog where Novig implies value, swept by edge threshold
+python -m models.mlb.line_shopping                       # all hitter markets
+python -m models.mlb.line_shopping --markets 403,293,289 # HRR / TB / RBI only
+```
+
+**Validating it's *tradeable*, not just a snapshot artifact.** A backtested
+discrepancy is only money if it survives until you can actually bet. The live
+dual-book capture (`novig_snapshots` + `underdog_props`, same cron ticks) lets us
+measure forward:
+- **Persistence** — when a discrepancy appears, is it still there minutes later?
+- **Direction of truth** — does Underdog converge toward Novig (confirming Novig
+  is the sharper price)?
+- **Liquidity** — is there real size behind the Novig price (`volume`, order book)?
+- **Out-of-sample ROI** — flag bets live, settle against box scores, tally.
+
+**Honest caveats:** Novig player-prop liquidity is thin pre-game and thickens near
+first pitch, so the tradeable edge may concentrate in fewer markets than the
+backtest suggests; and soft books limit/ban consistent +EV winners — the practical
+risk, not the math.
+
 ## What's next
 
-1. **Training script** (`models/mlb/hitter_prop_model.py`): trains all 3 targets through
-   expanding-season CV, saves bundles for each.
-2. **Backtest script** (`models/mlb/backtest.py`): joins Underdog odds via `bettingpros_props`
-   (book_id=36), computes ROI per EV-threshold per market, generates calibration plots.
-3. **Live prediction** (when v1 ROI clears its Sharpe threshold): daily script that pulls
-   current Underdog lines + computes EV against model P(over), surfaces flagged bets.
-4. **Underdog-only markets** (v2): once we have ~60 days of forward Underdog capture, train
-   a batter walks model (Underdog offers, BettingPros doesn't) using the same feature stack.
+1. **Paper-trade harness** — log live-flagged +EV bets (both strategies) with the
+   exact odds available at capture time, settle against box scores, and report
+   forward OOS ROI segmented by edge size, liquidity, and discrepancy persistence.
+   The decisive test of *tradeable* edge before any real money.
+2. **Model tuning + live prediction** — continue developing the predictive model;
+   when its backtested ROI clears its risk-adjusted threshold, surface daily flagged
+   bets alongside the line-shopping signal.
+3. **Combine the two signals** — blended fair value (Novig + model + consensus), or
+   use each to confirm the other.
+4. **Underdog-only markets** (v2): once we have ~60 days of forward capture, model
+   the batter-walks market (Underdog offers it, sharp books barely price it).
 
 ## Lessons from the totals work (preserved in `archive/`)
 

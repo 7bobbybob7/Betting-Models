@@ -1,8 +1,10 @@
-name: Underdog Props Capture
+name: Props Capture (Underdog + Novig)
 
-# Snapshot Underdog Fantasy MLB player prop lines throughout the day.
-# Inserts into underdog_props table. Captures line movement leading up
-# to game time for CLV measurement.
+# Snapshot MLB player prop lines throughout the day from BOTH books at the same ticks:
+#   - Underdog (soft DFS book)  -> underdog_props
+#   - Novig    (sharp exchange) -> novig_snapshots  (direct GraphQL, de-vigged prices)
+# Time-aligned captures let us measure whether Novig-vs-Underdog discrepancies persist
+# long enough to bet (the line-shopping / staleness validation).
 #
 # Schedule: more captures on weekends (more games, earlier starts).
 
@@ -29,10 +31,17 @@ jobs:
         with:
           python-version: '3.12'
           cache: 'pip'
-      # Slim install — Underdog scraper only needs requests + psycopg2 + pandas + dotenv.
-      # Skips heavy ML libs (sklearn, xgboost, pybaseball, statsmodels) that the cron doesn't need.
-      - run: pip install requests psycopg2-binary pandas python-dotenv
+      # Slim install — scrapers need requests + psycopg2 + pandas + dotenv; tzdata for
+      # zoneinfo (ET game-date conversion in the Novig scraper on minimal runners).
+      # Skips heavy ML libs (sklearn, xgboost, pybaseball, statsmodels) the cron doesn't need.
+      - run: pip install requests psycopg2-binary pandas python-dotenv tzdata
       - name: Capture Underdog props
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: python -m scrapers.props.underdog
+      # continue-on-error: a Novig hiccup must not drop the Underdog capture (or vice-versa)
+      - name: Capture Novig exchange lines
+        if: always()
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python -m scrapers.props.novig
