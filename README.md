@@ -4,31 +4,39 @@ A data + modeling pipeline for **MLB player prop betting** (Hits + Runs + RBIs,
 Total Bases, Hits, etc.) targeting Underdog Fantasy's adjusted-odds market.
 
 Pulls Statcast pitch data, MLB box scores, and prop lines from multiple books
-into Postgres on a daily schedule. Both strategies below ultimately produce the
+into Postgres on a daily schedule. All three legs below ultimately produce the
 same thing — a **`P_true` estimate** that, when it beats the price Underdog
 offers, makes a **positive-EV bet**.
 
-## Two strategies for finding +EV
+## Three legs for finding +EV
 
-The platform pursues two complementary paths to a profitable edge. They differ
+The platform pursues three complementary paths to a profitable edge. They differ
 only in *where the "true" probability comes from*:
 
-1. **Own predictive model** (`models/mlb/`) — build `P_true` ourselves from
-   matchup-aware features (batter vs pitch type, pitcher arsenal, lineup
-   context, swing tendencies). Hardest path: it requires out-forecasting the
-   market. In active development + validation.
+1. **Own predictive model** (`models/mlb/hitter_prop_model.py`) — build `P_true`
+   ourselves from matchup-aware features by training on game *outcomes*. Hardest
+   path: it requires out-forecasting the market. Currently feature-limited
+   (AUC ~0.55 vs the market's ~0.57); in active development.
 
 2. **+EV line-shopping / sharp-vs-soft** (`models/mlb/line_shopping.py`) — let a
    **sharp book be the model**. Take Novig's de-vigged exchange price as fair
-   value and bet Underdog (a softer DFS book) wherever its line lags. This is the
-   textbook +EV-betting approach used by tools like OddsJam/Outlier/Unabated, and
-   our backtest shows **genuine potential edge**: ROI rises monotonically with the
-   size of the Novig-vs-Underdog discrepancy — the mechanical signature of a real
-   edge, concentrated in large gaps and lower-volume markets. Now being validated
-   forward with live dual-book capture (see [Sharp-vs-soft line shopping](#sharp-vs-soft-line-shopping-ev)).
+   value and bet Underdog (a softer DFS book) wherever its line lags. The textbook
+   +EV approach (à la OddsJam/Outlier/Unabated); the backtest shows **genuine
+   potential edge** — ROI rises monotonically with the size of the Novig-vs-Underdog
+   discrepancy, the mechanical signature of a real edge. The proven near-term edge;
+   now being validated forward (see [Sharp-vs-soft line shopping](#sharp-vs-soft-line-shopping-ev)).
 
-Both feed one betting system; the model and the sharp reference can also be
-combined (e.g. blended fair value, or each used to confirm the other).
+3. **Distillation model** (`models/mlb/distill_model.py`) — train our *own* model
+   on Novig's price as a **soft target** (learn to reproduce the sharp line, not
+   noisy outcomes). The goal: an **owned, book-independent asset** that inherits
+   Novig's sharpness, so it survives if Novig vanishes and can be improved over time.
+   Sample-efficient (1 season of sharp labels ≈ 6 seasons of outcomes) but currently
+   capped at the same ~0.55 feature ceiling as leg 1 — closing the gap to Novig is a
+   *feature* problem, not a training-target one.
+
+All three feed one betting system; the legs can also be combined (blended fair
+value, or each used to confirm the others). Leg 2 is the edge that clears the vig
+today; legs 1 & 3 are the long-term owned models, gated on richer features.
 
 ## Why hitter props
 
@@ -63,7 +71,7 @@ Hitter props on Underdog have three advantages over game totals:
 | BettingPros historical props (Underdog 36 + Novig 60) | ✅ Backfilled 2024–2026 |
 | `mlb_batting_game.runs` column | ✅ Schema + historical backfill complete (100%) |
 
-**Strategy 1 — own predictive model**
+**Leg 1 — own predictive model (trained on outcomes)**
 
 | Component | Status |
 |-----------|--------|
@@ -71,16 +79,24 @@ Hitter props on Underdog have three advantages over game totals:
 | Dataset assembler | ✅ `models/mlb/hitter_prop_dataset.py` (+ parquet cache) |
 | Training (LR-L1 + XGBoost, isotonic calibration, expanding-season CV) | ✅ `models/mlb/hitter_prop_model.py` |
 | Backtest (EV threshold sweep vs Underdog odds) | ✅ `models/mlb/backtest.py` |
-| Model tuning + live deployment | 🚧 In validation |
+| Close feature gap to Novig (embeddings) → live deployment | 🚧 Feature-limited at ~0.55 AUC |
 
-**Strategy 2 — +EV line-shopping (sharp-vs-soft)**
+**Leg 2 — +EV line-shopping (sharp-vs-soft)**
 
 | Component | Status |
 |-----------|--------|
 | Novig vs Underdog discrepancy backtest | ✅ `models/mlb/line_shopping.py` — shows potential edge |
 | Live dual-book capture (Novig + Underdog, aligned ticks) | ✅ Running |
-| Forward paper-trade harness (persistence + OOS ROI) | 🚧 Next |
-| Live betting | ⏸️ Pending forward validation |
+| Forward paper-trade harness (pre-game filter, settle, ROI) | ✅ `models/mlb/paper_trade.py` — logging live |
+| Live betting | ⏸️ Pending forward validation (~weeks of settled bets) |
+
+**Leg 3 — distillation model (trained on Novig's price)**
+
+| Component | Status |
+|-----------|--------|
+| Distill features → Novig de-vigged price | ✅ `models/mlb/distill_model.py` |
+| Walk-forward CV (monthly, embargoed) | ✅ stable ~0.55 AUC, reproduces Novig (MAE ~0.027) |
+| Close feature gap so distilled model clears the vig | 🚧 Feature-limited (same ceiling as leg 1) |
 
 ## Architecture
 
@@ -93,22 +109,22 @@ Hitter props on Underdog have three advantages over game totals:
    BettingPros API ──► scrapers/props/bettingpros.py         ──► bettingpros_props (Underdog 36 + Novig 60, history)
                                                                           │
                                                                           ▼
-                                                  Postgres on Supabase
+                                              Postgres on Supabase
                                                           │
-                  ┌───────────────────────────────────────┴───────────────────────────────┐
-                  ▼                                                                          ▼
-   STRATEGY 1 — own model                                            STRATEGY 2 — +EV line-shopping
-   ────────────────────────                                          ──────────────────────────────
-   batter_/pitcher_/context_/matchup_features.py                     models/mlb/line_shopping.py
-        │  (112 leak-safe features)                                       │  Novig de-vigged fair price
-        ▼                                                                 ▼  vs Underdog offered odds
-   hitter_prop_dataset.py  ──►  hitter_prop_model.py  ──► backtest.py     bet where the soft book lags
-   (assemble + label)           (LR-L1 + XGBoost,        (EV sweep        (ROI rises with discrepancy)
-                                 isotonic calibration)    vs Underdog)          │
-        │                                                                       ▼
-        └────────────────────────────┬──────────────────────────────►  forward paper-trade harness
-                                      ▼                                   (persistence + OOS ROI; planned)
-                           one betting system / EV gate
+        ┌─────────────────────────────────────┬──────────────────────────────────┐
+        ▼                                      ▼                                    ▼
+ LEG 1 — own model (outcomes)        LEG 2 — line-shopping (+EV)        LEG 3 — distillation
+ ───────────────────────────        ──────────────────────────        ────────────────────────
+ features → predict outcome          Novig fair price vs Underdog       features → predict Novig price
+ hitter_prop_dataset.py              line_shopping.py                   distill_model.py
+ hitter_prop_model.py                bet where soft book lags           (owned, Novig-independent;
+ backtest.py                         (ROI rises w/ discrepancy)          sample-efficient)
+ (AUC ~0.55, feature-capped)              │                             (AUC ~0.55, feature-capped)
+        │                                 ▼                                       │
+        │                     paper_trade.py  (pre-game filter,                   │
+        │                      log +EV → settle vs box scores → ROI)              │
+        └─────────────────────────────────┴──────────────────────────────────────┘
+                                  one betting system / EV gate
 ```
 
 ## Repo layout
@@ -153,19 +169,23 @@ Hitter props on Underdog have three advantages over game totals:
 │       │                                   weather, lineup OBP-in-front, SLG-behind)
 │       ├── matchup_features.py           — 6 cross-features (handedness-aware weighted xwOBA)
 │       ├── hitter_prop_dataset.py        — Assembler: 112 features + HRR/TB/RBI labels
+│       │  # Leg 1 — own model (trained on outcomes)
 │       ├── hitter_prop_model.py          — Train LR-L1 + XGBoost, isotonic calibration, CV
 │       ├── backtest.py                   — Model EV sweep vs Underdog odds
 │       ├── cache/                        — Cached feature parquets (train / backtest splits)
-│       │  # Strategy 2 — +EV line-shopping
-│       └── line_shopping.py              — Novig-vs-Underdog discrepancy backtest (sharp-vs-soft)
+│       │  # Leg 2 — +EV line-shopping
+│       ├── line_shopping.py              — Novig-vs-Underdog discrepancy backtest (sharp-vs-soft)
+│       ├── paper_trade.py                — Forward paper-trade: log pre-game +EV / settle / report
+│       │  # Leg 3 — distillation (trained on Novig's price)
+│       └── distill_model.py              — Distill Novig fair price into our own model (+ walk-forward CV)
 │                                            (totals-era models live in archive/models/mlb/)
 │
 ├── scripts/
 │   └── daily_refresh.py      — Morning cron entry point
 │
 ├── .github/workflows/
-│   ├── daily_pipeline.yml    — Morning: games + box scores + Statcast + handedness refresh
-│   └── underdog_capture.yml  — 3-4x daily: snapshots BOTH Underdog + Novig prop lines
+│   ├── daily_pipeline.yml    — Morning: box scores + Statcast + handedness + paper-trade settle
+│   └── underdog_capture.yml  — 5-6x daily: snapshot Underdog + Novig + log paper-trade +EV
 │
 ├── config.py
 ├── requirements.txt
@@ -199,25 +219,25 @@ Key tables:
 - `underdog_props` — Underdog (soft book) prop snapshots, multiple per day per line (forward capture)
 - `novig_snapshots` — Novig (sharp book) exchange snapshots: de-vigged last/available prices + volume, intraday
 - `bettingpros_props` — historical props for Underdog (36) + Consensus (0) + Novig (60), back to Apr 2024
+- `paper_bets` — forward-logged pre-game +EV line-shopping bets, settled vs outcomes (the tradeable-edge test)
 - `predictions` — model predictions log (currently inactive; was used by retired totals models)
 
 ## Daily cron schedule
 
-All times in UTC. ET = UTC-4 during summer.
+All times in UTC. ET = UTC-4 during summer. **Note:** GitHub Actions schedules run
+LATE under load (observed ~1-2h delay), so nominal times are set earlier than the
+target and ticks are denser for redundancy — the goal is that every game gets at
+least one clean PRE-GAME snapshot. Correctness doesn't depend on exact timing: the
+paper-trade layer enforces `scheduled_start > capture_time` regardless of when a run lands.
 
-Each `underdog_capture.yml` tick now snapshots **both** Underdog and Novig at the
-same timestamp, so discrepancies can be compared time-aligned.
+Each `underdog_capture.yml` tick snapshots **both** Underdog and Novig (aligned
+within seconds) and then logs pre-game +EV paper bets from those snapshots.
 
 | Cron | Workflow | What it does |
 |------|----------|--------------|
-| `0 10 * * *` (6 AM ET) | `daily_pipeline.yml` | Box scores + Statcast (last 3 days) + handedness backfill for new players |
-| `0 15 * * 1-5` (11 AM ET, weekday) | `underdog_capture.yml` | Underdog + Novig — opening-ish lines |
-| `0 19 * * 1-5` (3 PM ET, weekday) | `underdog_capture.yml` | Underdog + Novig — mid-day movement |
-| `0 22 * * 1-5` (6 PM ET, weekday) | `underdog_capture.yml` | Underdog + Novig — pre-night-games |
-| `0 14 * * 0,6` (10 AM ET, weekend) | `underdog_capture.yml` | Underdog + Novig — opening lines |
-| `30 16 * * 0,6` (12:30 PM ET, weekend) | `underdog_capture.yml` | Underdog + Novig — pre-day-games |
-| `0 20 * * 0,6` (4 PM ET, weekend) | `underdog_capture.yml` | Underdog + Novig — mid-afternoon |
-| `0 22 * * 0,6` (6 PM ET, weekend) | `underdog_capture.yml` | Underdog + Novig — pre-night-games |
+| `0 10 * * *` (6 AM ET) | `daily_pipeline.yml` | Box scores + Statcast + handedness backfill + **settle paper bets** |
+| `0 12,14,17,20,22 * * 1-5` (weekday) | `underdog_capture.yml` | Snapshot Underdog + Novig, log pre-game +EV |
+| `0 13,15,17,19,21,23 * * 0,6` (weekend) | `underdog_capture.yml` | Snapshot Underdog + Novig, log pre-game +EV |
 
 ## Setup (for a fresh clone)
 
@@ -331,9 +351,9 @@ probabilities fed to the EV gate are honest (no high-confidence overconfidence).
 one with the best risk-adjusted return (Sharpe-like: mean ROI / std ROI). Expectation is
 that frequent low-edge bets compound better than rare high-edge ones.
 
-## Sharp-vs-soft line shopping (+EV)
+## Sharp-vs-soft line shopping (+EV) — Leg 2
 
-The second strategy needs no predictive model of our own — it lets the **sharp
+Leg 2 needs no predictive model of our own — it lets the **sharp
 market be the model**:
 
 1. Take **Novig**'s exchange price as fair value. Novig is a no-vig exchange, so its
@@ -356,32 +376,62 @@ python -m models.mlb.line_shopping                       # all hitter markets
 python -m models.mlb.line_shopping --markets 403,293,289 # HRR / TB / RBI only
 ```
 
-**Validating it's *tradeable*, not just a snapshot artifact.** A backtested
-discrepancy is only money if it survives until you can actually bet. The live
-dual-book capture (`novig_snapshots` + `underdog_props`, same cron ticks) lets us
-measure forward:
-- **Persistence** — when a discrepancy appears, is it still there minutes later?
-- **Direction of truth** — does Underdog converge toward Novig (confirming Novig
-  is the sharper price)?
-- **Liquidity** — is there real size behind the Novig price (`volume`, order book)?
-- **Out-of-sample ROI** — flag bets live, settle against box scores, tally.
+**Validating it's *tradeable* — the paper-trade harness (`paper_trade.py`).** A
+backtested discrepancy is only money if it survives until you can actually bet, and
+on data the strategy never saw. The harness runs forward on the live dual-book
+capture and is the decisive test:
+
+```bash
+python -m models.mlb.paper_trade log      # flag + log pre-game +EV (runs each cron tick)
+python -m models.mlb.paper_trade settle   # fill outcomes from box scores (runs each morning)
+python -m models.mlb.paper_trade report   # realized ROI by edge bucket / market / per-prop
+```
+
+It bakes in the **pre-game filter** (`scheduled_start > capture_time`) so live/in-progress
+prices can never contaminate it, logs every +EV opportunity with the exact Underdog odds
+at flag time, settles against `mlb_batting_game`, and reports realized ROI segmented by
+edge size, market, and a one-bet-per-prop view. Accumulating now; a real read needs
+hundreds of settled bets (weeks) before the law of large numbers applies.
 
 **Honest caveats:** Novig player-prop liquidity is thin pre-game and thickens near
 first pitch, so the tradeable edge may concentrate in fewer markets than the
 backtest suggests; and soft books limit/ban consistent +EV winners — the practical
 risk, not the math.
 
+## Distillation model (+EV) — Leg 3
+
+Leg 3 builds an **owned, book-independent** version of the sharp price. Instead of
+training on noisy game outcomes (leg 1), it trains on **Novig's de-vigged price as a
+soft target** — learning to reproduce the sharp line from our features:
+
+```bash
+python -m models.mlb.distill_model --target all          # fit + compare vs outcome model
+python -m models.mlb.distill_model --mode cv --target all # monthly walk-forward CV (embargoed)
+```
+
+Why it matters: if Novig disappears (API closes, book shuts down) or quietly drifts,
+the distilled sharpness is already in our weights — and it covers props Novig doesn't
+price. Walk-forward CV shows it's **stable (~0.55 AUC) and sample-efficient** (≈1 season
+of sharp labels matches 6 seasons of outcomes), reproducing Novig with ~0.027 MAE.
+
+**The key finding:** distillation lands at the *same* ~0.55 ceiling as the outcome
+model, short of Novig's ~0.57. Changing the training target didn't help — which proves
+the bottleneck is **features, not the loss**. Closing that ~0.02 gap (the difference
+between losing to the vig and beating it) is a richer-features problem: pitcher
+pitch-shape + batter swing embeddings. Until then, leg 3 is the owned fallback/monitor,
+and leg 2 (live Novig directly, zero approximation error) is what actually clears the vig.
+
 ## What's next
 
-1. **Paper-trade harness** — log live-flagged +EV bets (both strategies) with the
-   exact odds available at capture time, settle against box scores, and report
-   forward OOS ROI segmented by edge size, liquidity, and discrepancy persistence.
-   The decisive test of *tradeable* edge before any real money.
-2. **Model tuning + live prediction** — continue developing the predictive model;
-   when its backtested ROI clears its risk-adjusted threshold, surface daily flagged
-   bets alongside the line-shopping signal.
-3. **Combine the two signals** — blended fair value (Novig + model + consensus), or
-   use each to confirm the other.
+1. **Accumulate paper-trade results** (running automatically) — the decisive
+   tradeable-edge test; revisit after ~weeks of settled bets, segmenting by edge
+   size, liquidity, and discrepancy persistence.
+2. **Close the feature gap (legs 1 & 3)** — both own-models plateau at ~0.55 AUC vs
+   Novig's ~0.57, and we proved the bottleneck is *features*, not the training target.
+   Pitcher pitch-shape + batter swing embeddings are the path to matching Novig — which
+   would make the owned model bettable on its own (and on books Novig doesn't cover).
+3. **Combine the legs** — blended fair value (Novig + distill + model), or use the
+   model/archetype priors (e.g. K-suppression) to confirm line-shopping bets.
 4. **Underdog-only markets** (v2): once we have ~60 days of forward capture, model
    the batter-walks market (Underdog offers it, sharp books barely price it).
 

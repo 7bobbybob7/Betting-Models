@@ -40,3 +40,10 @@ jobs:
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: python -m scrapers.mlb.backfill_player_handedness --new-only
+
+      # Settle yesterday's paper-trade bets now that box scores are in
+      - name: Settle paper-trade bets
+        if: always()
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python -m models.mlb.paper_trade settle

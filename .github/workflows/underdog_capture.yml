@@ -9,16 +9,15 @@ name: Props Capture (Underdog + Novig)
 # Schedule: more captures on weekends (more games, earlier starts).
 
 on:
+  # NOTE: GitHub Actions schedules run LATE under load — observed ~1-2h delay. So nominal
+  # times are set EARLIER than the target, and we add extra ticks for redundancy, so every
+  # game gets at least one clean PRE-GAME snapshot (scheduled_start > capture time). The
+  # analysis/paper-trade layer enforces the pre-game filter regardless of when a run lands.
   schedule:
-    # Weekdays (Mon-Fri, day-of-week 1-5)
-    - cron: '0 15 * * 1-5'   # 11:00 AM ET — opening lines
-    - cron: '0 19 * * 1-5'   # 3:00 PM ET — mid-day movement
-    - cron: '0 22 * * 1-5'   # 6:00 PM ET — pre-night games
-    # Weekends (Sun=0, Sat=6)
-    - cron: '0 14 * * 0,6'   # 10:00 AM ET — opening lines
-    - cron: '30 16 * * 0,6'  # 12:30 PM ET — pre day games
-    - cron: '0 20 * * 0,6'   # 4:00 PM ET — afternoon
-    - cron: '0 22 * * 0,6'   # 6:00 PM ET — pre-night games
+    # Weekdays (Mon-Fri). Earliest ticks target day games (~1pm ET / 17:00 UTC first pitch).
+    - cron: '0 12,14,17,20,22 * * 1-5'
+    # Weekends have more/earlier day games — sample a bit denser.
+    - cron: '0 13,15,17,19,21,23 * * 0,6'
   workflow_dispatch:  # Manual trigger
 
 jobs:
@@ -45,3 +44,10 @@ jobs:
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: python -m scrapers.props.novig
+      # Log pre-game +EV line-shopping bets from the snapshots we just captured.
+      # Pre-game filter is baked into paper_trade (scheduled_start > capture time).
+      - name: Log paper-trade +EV bets
+        if: always()
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python -m models.mlb.paper_trade log
