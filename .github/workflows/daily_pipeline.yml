@@ -36,6 +36,13 @@ jobs:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: python -m scrapers.mlb.statcast_daily --days 3
 
+      # Keep pitch extras current (catcher/framing, spray, bat tracking, swing path).
+      # Idempotent — rolling 4-day window just tops up what the backfill already has.
+      - name: Top up pitch extras (rolling 4 days)
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python -m scrapers.mlb.backfill_pitch_extras --start "$(date -u -d '4 days ago' +%F)"
+
       - name: Backfill handedness for any new players (rookies, call-ups)
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}

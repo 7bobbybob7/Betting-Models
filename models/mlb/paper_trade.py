@@ -89,13 +89,19 @@ def log_bets(min_ev=MIN_EV):
     ud_t = ud_row.iloc[0].snapshot_ts
     print(f"pairing Novig {nv_t} with Underdog {ud_t}")
 
-    # Novig: traded (last present) AND pre-game
-    nv = query("""SELECT player_name, market_type, strike, over_last, under_last, volume, scheduled_start
+    # Novig: PRE-GAME with a live TWO-SIDED order book (both available prices present).
+    # Fair value = bid/ask midpoint of `available` — NOT the last-traded price, which can
+    # be hours stale and manufactures false +EV. (Validated: last -> -12.6% ROI,
+    # available -> +0.8%, mid -> +10.5% on the same data.) Two-sided requirement also
+    # acts as a liquidity filter.
+    nv = query("""SELECT player_name, market_type, strike, over_available, under_available,
+                         volume, scheduled_start
                   FROM novig_snapshots
-                  WHERE captured_at=%(t)s AND over_last IS NOT NULL AND scheduled_start > %(t)s""",
+                  WHERE captured_at=%(t)s AND scheduled_start > %(t)s
+                    AND over_available IS NOT NULL AND under_available IS NOT NULL""",
                params={'t': nv_t})
     if len(nv) == 0:
-        print("no traded pre-game Novig props at latest capture"); return 0
+        print("no pre-game Novig props with a two-sided book at latest capture"); return 0
     nv['ud_stat'] = nv['market_type'].map(MKT_TO_UD)
     nv = nv.dropna(subset=['ud_stat'])
     nv['key'] = nv['player_name'].map(_norm) + '|' + nv['ud_stat'] + '|' + nv['strike'].astype(float).astype(str)
@@ -113,14 +119,16 @@ def log_bets(min_ev=MIN_EV):
 
     m['od'] = m['higher'].apply(_to_decimal)
     m['ud'] = m['lower'].apply(_to_decimal)
-    m['ev_o'] = m['over_last'] * (m['od'] - 1) - (1 - m['over_last'])
-    m['ev_u'] = m['under_last'] * (m['ud'] - 1) - (1 - m['under_last'])
+    # Fair P(over) = midpoint of Novig's two-sided book: (ask_over + (1 - ask_under)) / 2
+    m['fair_over'] = (m['over_available'] + (1 - m['under_available'])) / 2
+    m['ev_o'] = m['fair_over'] * (m['od'] - 1) - (1 - m['fair_over'])
+    m['ev_u'] = (1 - m['fair_over']) * (m['ud'] - 1) - m['fair_over']
     over = m['ev_o'] >= m['ev_u']
     m['side'] = np.where(over, 'OVER', 'UNDER')
     m['ev'] = np.where(over, m['ev_o'], m['ev_u'])
     m['ud_odds'] = np.where(over, m['higher'], m['lower']).astype(int)
     m['payout'] = np.where(over, m['od'], m['ud'])
-    m['fair'] = np.where(over, m['over_last'], m['under_last'])
+    m['fair'] = np.where(over, m['fair_over'], 1 - m['fair_over'])
 
     name2id = _novig_name_to_player_id()
     m['player_id'] = m['player_name'].map(_norm).map(name2id)
@@ -225,15 +233,163 @@ def report():
           f"hit={last.won.mean():.3f}  ROI/bet={last.profit.mean():+.4f}")
 
 
+# ----------------------------------------------------------------------------
+# show — current actionable +EV bets (pre-game, freshest line per prop)
+# ----------------------------------------------------------------------------
+
+def show(min_ev=0.0, min_volume=0.0, top=30):
+    rows = query("""SELECT player_name, market_type, line, side, ud_odds, novig_fair, ev,
+                           novig_volume, scheduled_start, capture_at
+                    FROM paper_bets
+                    WHERE settled_at IS NULL AND scheduled_start > now()""")
+    if len(rows) == 0:
+        print("No upcoming pre-game +EV bets logged right now.")
+        print("(Populated each capture tick — check after the next cron run, or run `log`.)")
+        return
+    # freshest line per prop (latest capture before game)
+    rows = (rows.sort_values('capture_at')
+                .groupby(['player_name', 'market_type', 'line', 'side'], as_index=False).last())
+    rows = rows[(rows['ev'] >= min_ev) & (rows['novig_volume'] >= min_volume)]
+    rows = rows.sort_values('ev', ascending=False)
+    if len(rows) == 0:
+        print(f"No upcoming bets pass ev>={min_ev:.0%}, volume>={min_volume:.0f}.")
+        return
+
+    now = pd.Timestamp.now(tz='UTC')
+    print(f"Upcoming +EV bets — {len(rows)} (showing top {min(top,len(rows))}); "
+          f"ev>={min_ev:.0%}, vol>={min_volume:.0f}\n")
+    print(f"{'EV':>6s} {'side':>5s} {'player':22s} {'market':16s} {'ln':>4s} "
+          f"{'UDodds':>7s} {'fair':>5s} {'vol':>7s} {'1st pitch ET':>12s} {'in':>5s}")
+    print("-"*100)
+    for r in rows.head(top).itertuples():
+        sp = pd.Timestamp(r.scheduled_start)
+        mins = int((sp - now).total_seconds() / 60)
+        eta = f"{mins//60}h{mins%60:02d}m" if mins >= 60 else f"{mins}m"
+        print(f"{r.ev*100:>5.1f}% {r.side:>5s} {r.player_name[:22]:22s} {r.market_type[:16]:16s} "
+              f"{float(r.line):>4.1f} {int(r.ud_odds):>+7d} {float(r.novig_fair):>5.2f} "
+              f"{float(r.novig_volume or 0):>7.0f} {sp.tz_convert('America/New_York').strftime('%m-%d %H:%M'):>12s} {eta:>5s}")
+
+
+# ----------------------------------------------------------------------------
+# reprocess — re-derive bets from stored snapshots under different fair-value
+# sources (last vs available vs mid) + a liquidity filter, settle in-memory,
+# and compare. Lets us test signal fixes on data already captured.
+# ----------------------------------------------------------------------------
+
+def _boxscore_lookup():
+    box = query("""
+        SELECT bg.player_id, g.game_date,
+               SUM(bg.hits) hits, SUM(bg.doubles) doubles, SUM(bg.triples) triples, SUM(bg.hr) hr,
+               SUM(bg.rbi) rbi, SUM(bg.runs) runs, SUM(bg.bb) bb, SUM(bg.sb) sb
+        FROM mlb_batting_game bg JOIN games g ON bg.game_id=g.game_id
+        WHERE g.sport_id=2 AND g.status='final'
+        GROUP BY bg.player_id, g.game_date""")
+    box['game_date'] = pd.to_datetime(box['game_date']).dt.date
+    return {(int(r.player_id), r.game_date): r._asdict() for r in box.itertuples()}
+
+
+def _fair_over(row, src):
+    """Novig fair P(over) from the chosen source. Returns None if unavailable."""
+    ol, ul = row.get('over_last'), row.get('under_last')
+    oa, ua = row.get('over_available'), row.get('under_available')
+    if src == 'last':
+        return float(ol) if pd.notna(ol) else None
+    if src == 'available':                       # two-sided live book required
+        if pd.notna(oa) and pd.notna(ua) and (oa + ua) > 0:
+            return float(oa) / float(oa + ua)
+        return None
+    if src == 'mid':                             # midpoint of best bid/ask
+        if pd.notna(oa) and pd.notna(ua):
+            return (float(oa) + (1 - float(ua))) / 2
+        return None
+    return None
+
+
+def reprocess(src='available', min_volume=0.0, min_ev=MIN_EV):
+    name2id = _novig_name_to_player_id()
+    box = _boxscore_lookup()
+    caps = query("SELECT DISTINCT captured_at FROM novig_snapshots ORDER BY captured_at")
+    rows = []
+    for cap in caps['captured_at']:
+        ud = query("""SELECT snapshot_ts FROM underdog_props
+            WHERE ABS(EXTRACT(EPOCH FROM (snapshot_ts-%(t)s))) <= %(w)s
+            ORDER BY ABS(EXTRACT(EPOCH FROM (snapshot_ts-%(t)s))) LIMIT 1""",
+            params={'t': cap, 'w': PAIR_WINDOW_MIN*60})
+        if len(ud) == 0:
+            continue
+        ud_t = ud.iloc[0].snapshot_ts
+        nv = query("""SELECT player_name, market_type, strike, game_date,
+            over_last, under_last, over_available, under_available, volume
+            FROM novig_snapshots WHERE captured_at=%(t)s AND scheduled_start > %(t)s""", params={'t': cap})
+        if len(nv) == 0:
+            continue
+        nv['ud_stat'] = nv['market_type'].map(MKT_TO_UD); nv = nv.dropna(subset=['ud_stat'])
+        nv['key'] = nv['player_name'].map(_norm)+'|'+nv['ud_stat']+'|'+nv['strike'].astype(float).astype(str)
+        udp = query("""SELECT player_first_name,player_last_name,stat_type,stat_value,choice,american_price
+            FROM underdog_props WHERE snapshot_ts=%(t)s""", params={'t': ud_t})
+        udp['key'] = ((udp['player_first_name'].fillna('')+' '+udp['player_last_name'].fillna('')).map(_norm)
+                      +'|'+udp['stat_type']+'|'+udp['stat_value'].astype(float).astype(str))
+        piv = (udp.pivot_table(index='key', columns='choice', values='american_price', aggfunc='first')
+                  .dropna(subset=['higher','lower']).reset_index())
+        m = nv.merge(piv, on='key', how='inner')
+        for r in m.itertuples():
+            d = r._asdict()
+            if (d.get('volume') or 0) < min_volume:
+                continue
+            fair = _fair_over(d, src)
+            if fair is None:
+                continue
+            od, udd = _to_decimal(d['higher']), _to_decimal(d['lower'])
+            ev_o = fair*(od-1) - (1-fair); ev_u = (1-fair)*(udd-1) - fair
+            side = 'OVER' if ev_o >= ev_u else 'UNDER'
+            ev = max(ev_o, ev_u)
+            if ev <= min_ev:
+                continue
+            pid = name2id.get(_norm(d['player_name']))
+            gd = pd.to_datetime(d['game_date']).date() if d.get('game_date') is not None else None
+            if pid is None or (pid, gd) not in box:
+                continue                          # unsettleable
+            b = box[(pid, gd)]
+            actual = _actual_for(d['market_type'], b)
+            if actual is None:
+                continue
+            won = (actual > float(d['strike'])) if side == 'OVER' else (actual < float(d['strike']))
+            payout = od if side == 'OVER' else udd
+            rows.append({'capture_at': cap, 'game_date': gd, 'player_id': pid,
+                         'market': d['market_type'], 'line': float(d['strike']), 'side': side,
+                         'ev': ev, 'volume': float(d.get('volume') or 0),
+                         'won': bool(won), 'profit': (payout-1.0) if won else -1.0})
+    return pd.DataFrame(rows)
+
+
+def compare_sources():
+    box_n = len(_boxscore_lookup())
+    print(f"(box-score player-games available: {box_n:,})\n")
+    for src in ['last', 'available', 'mid']:
+        d = reprocess(src)
+        if len(d) == 0:
+            print(f"{src:10s}: no settleable bets"); continue
+        d['evb'] = pd.cut(d['ev'], [0,.02,.04,.06,1], labels=['0-2','2-4','4-6','6+'])
+        by = d.groupby('evb', observed=True)['profit'].agg(['size','mean'])
+        line = "  ".join(f"{b}:{r['size']:.0f}@{r['mean']:+.2f}" for b, r in by.iterrows())
+        print(f"{src:10s}: n={len(d):4d}  hit={d.won.mean():.3f}  ROI={d.profit.mean():+.4f}  "
+              f"units={d.profit.sum():+.1f}   [{line}]")
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=["log", "settle", "report"])
+    ap.add_argument("cmd", choices=["log", "settle", "report", "compare", "show"])
     ap.add_argument("--min-ev", type=float, default=MIN_EV)
+    ap.add_argument("--min-volume", type=float, default=0.0)
     args = ap.parse_args()
-    if args.cmd == "log":
+    if args.cmd == "compare":
+        compare_sources()
+    elif args.cmd == "log":
         log_bets(args.min_ev)
     elif args.cmd == "settle":
         settle()
+    elif args.cmd == "show":
+        show(args.min_ev, args.min_volume)
     else:
         report()
 
