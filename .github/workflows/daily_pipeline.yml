@@ -54,3 +54,22 @@ jobs:
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: python -m models.mlb.paper_trade settle
+
+      # Pull prop lines + results from BettingPros (Underdog 36 + Novig 60). Was never
+      # cronned before 2026-07 — data silently stopped at the last manual backfill.
+      # Trailing 3 days so late-scored actuals get refreshed.
+      - name: Pull BettingPros props (trailing 3 days)
+        if: always()
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          python -m scrapers.props.bettingpros --start "$(date -u -d '3 days ago' +%F)" --end "$(date -u +%F)"
+
+      # Score yesterday's TB props with the v3 model (Attack 3 winner) — retrospective,
+      # leak-safe by construction; accumulates forward OOS evidence in v3_signals.
+      # Runs AFTER the BettingPros pull (needs its odds + actuals).
+      - name: Log v3 TB model signals
+        if: always()
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python -m models.mlb.v3_tracker log --days 2
