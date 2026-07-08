@@ -48,16 +48,19 @@ FAST_SWING = 75.0    # mph threshold for an "A-swing"
 # ----------------------------------------------------------------------------
 
 def _pull_batted_balls(start: date, end: date) -> pd.DataFrame:
-    """Per BIP: batter, date, stand, hc_x, hc_y (for pull/oppo)."""
+    """Per BIP: batter, date, stand, pitcher hand, spray coords, launch angle/speed,
+    bat speed — serves pull/oppo, pull-air, smash factor, and platoon-split pull."""
     sql = """
         SELECT p.batter_id AS player_id, g.game_date, pl.bats AS stand,
-               e.hc_x, e.hc_y
+               pp.throws AS pthrows,
+               e.hc_x, e.hc_y, p.launch_angle, p.launch_speed, e.bat_speed
         FROM mlb_pitches p
         JOIN mlb_pitch_extras e
           ON e.game_id = p.game_id AND e.at_bat_number = p.at_bat_number
          AND e.pitch_number = p.pitch_number
         JOIN games g ON p.game_id = g.game_id
         JOIN players pl ON p.batter_id = pl.player_id
+        LEFT JOIN players pp ON p.pitcher_id = pp.player_id
         WHERE p.is_in_play = true AND e.hc_x IS NOT NULL AND e.hc_y IS NOT NULL
           AND pl.bats IN ('L','R','S')
           AND g.game_date >= %(s)s AND g.game_date < %(e)s
@@ -66,10 +69,10 @@ def _pull_batted_balls(start: date, end: date) -> pd.DataFrame:
 
 
 def _pull_swings(start: date, end: date) -> pd.DataFrame:
-    """Per swing with bat-tracking: batter, date, bat_speed, swing_length, attack_angle."""
+    """Per swing with bat-tracking: bat_speed, swing_length, attack_angle, pitch velo."""
     sql = """
         SELECT p.batter_id AS player_id, g.game_date,
-               e.bat_speed, e.swing_length, e.attack_angle
+               e.bat_speed, e.swing_length, e.attack_angle, p.release_speed
         FROM mlb_pitches p
         JOIN mlb_pitch_extras e
           ON e.game_id = p.game_id AND e.at_bat_number = p.at_bat_number
@@ -177,31 +180,54 @@ def build_training_set(start_date: date, end_date: date) -> pd.DataFrame:
         ['game_id', 'player_id']).copy()
     spine_dates = out[['player_id', 'game_date']].drop_duplicates()
 
-    # ---- batter spray (pull/oppo) ----
+    # ---- batter spray: pull/oppo + BATCH 1 (pull-air, smash factor, platoon-split pull) ----
     bb = _spray_labels(bb); bb['bip'] = 1.0
-    r = _roll_rate(bb, ['pulled', 'oppo', 'bip'], BAT_WINDOW)
+    la = bb['launch_angle'].astype(float)
+    bb['pulled_air'] = (bb['pulled'].astype(bool) & (la > 20)).astype(float)
+    # smash factor = EV / bat speed on events where both are measured (real swings only)
+    pair = (bb['launch_speed'].notna() & bb['bat_speed'].notna()
+            & (bb['bat_speed'].astype(float) >= 60))
+    bb['ls_p'] = np.where(pair, bb['launch_speed'].astype(float), 0.0)
+    bb['bs_p'] = np.where(pair, bb['bat_speed'].astype(float), 0.0)
+    bb['pair_n'] = pair.astype(float)
+    vsL = bb['pthrows'] == 'L'
+    bb['pulled_L'] = np.where(vsL, bb['pulled'], 0.0); bb['bip_L'] = vsL.astype(float)
+    bb['pulled_R'] = np.where(~vsL, bb['pulled'], 0.0); bb['bip_R'] = (~vsL).astype(float)
+    r = _roll_rate(bb, ['pulled', 'oppo', 'bip', 'pulled_air', 'ls_p', 'bs_p', 'pair_n',
+                        'pulled_L', 'bip_L', 'pulled_R', 'bip_R'], BAT_WINDOW)
     sp = spine_dates.merge(r, on=['player_id', 'game_date'], how='left')
     ok = sp['bip'] >= MIN_BIP
     sp['bat_pull_rate_120d'] = np.where(ok, sp['pulled'] / sp['bip'], np.nan)
     sp['bat_oppo_rate_120d'] = np.where(ok, sp['oppo'] / sp['bip'], np.nan)
-    out = out.merge(sp[['player_id', 'game_date', 'bat_pull_rate_120d', 'bat_oppo_rate_120d']],
+    sp['bat_pull_air_rate_120d'] = np.where(ok, sp['pulled_air'] / sp['bip'], np.nan)
+    sp['bat_smash_factor_120d'] = np.where(sp['pair_n'] >= 20, sp['ls_p'] / sp['bs_p'], np.nan)
+    sp['bat_pull_rate_vs_L_120d'] = np.where(sp['bip_L'] >= 15, sp['pulled_L'] / sp['bip_L'], np.nan)
+    sp['bat_pull_rate_vs_R_120d'] = np.where(sp['bip_R'] >= 25, sp['pulled_R'] / sp['bip_R'], np.nan)
+    out = out.merge(sp[['player_id', 'game_date', 'bat_pull_rate_120d', 'bat_oppo_rate_120d',
+                        'bat_pull_air_rate_120d', 'bat_smash_factor_120d',
+                        'bat_pull_rate_vs_L_120d', 'bat_pull_rate_vs_R_120d']],
                     on=['player_id', 'game_date'], how='left')
 
-    # ---- bat tracking ----
+    # ---- bat tracking (+ BATCH 1: bat speed vs premium velocity) ----
     sw['n'] = 1.0
     sw['fast'] = (sw['bat_speed'].astype(float) >= FAST_SWING).astype(float)
     sw['bs_sum'] = sw['bat_speed'].astype(float)
     sw['sl_sum'] = sw['swing_length'].astype(float)
     sw['aa_sum'] = sw['attack_angle'].astype(float)
-    r = _roll_rate(sw, ['bs_sum', 'sl_sum', 'aa_sum', 'fast', 'n'], BAT_WINDOW)
+    prem = sw['release_speed'].astype(float) >= 95
+    sw['bs_v'] = np.where(prem, sw['bs_sum'], 0.0)
+    sw['n_v'] = prem.astype(float)
+    r = _roll_rate(sw, ['bs_sum', 'sl_sum', 'aa_sum', 'fast', 'n', 'bs_v', 'n_v'], BAT_WINDOW)
     t = spine_dates.merge(r, on=['player_id', 'game_date'], how='left')
     ok = t['n'] >= MIN_SWINGS
     t['bat_bat_speed_120d']       = np.where(ok, t['bs_sum'] / t['n'], np.nan)
     t['bat_swing_len_120d']       = np.where(ok, t['sl_sum'] / t['n'], np.nan)
     t['bat_attack_angle_120d']    = np.where(ok, t['aa_sum'] / t['n'], np.nan)
     t['bat_fast_swing_rate_120d'] = np.where(ok, t['fast'] / t['n'], np.nan)
+    t['bat_speed_vs95_120d']      = np.where(t['n_v'] >= 15, t['bs_v'] / t['n_v'], np.nan)
     out = out.merge(t[['player_id', 'game_date', 'bat_bat_speed_120d', 'bat_swing_len_120d',
-                       'bat_attack_angle_120d', 'bat_fast_swing_rate_120d']],
+                       'bat_attack_angle_120d', 'bat_fast_swing_rate_120d',
+                       'bat_speed_vs95_120d']],
                     on=['player_id', 'game_date'], how='left')
 
     # ---- opposing-catcher framing: per-catcher rolling rate, joined via the game's
