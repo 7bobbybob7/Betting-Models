@@ -75,11 +75,14 @@ Hitter props on Underdog have three advantages over game totals:
 
 | Component | Status |
 |-----------|--------|
-| Feature stack (batter/pitcher/context/matchup) | ✅ 112 features, 4 modules, leak-safe |
-| Dataset assembler | ✅ `models/mlb/hitter_prop_dataset.py` (+ parquet cache) |
-| Training (LR-L1 + XGBoost, isotonic calibration, expanding-season CV) | ✅ `models/mlb/hitter_prop_model.py` |
-| Backtest (EV threshold sweep vs Underdog odds) | ✅ `models/mlb/backtest.py` |
-| Close feature gap to Novig (embeddings) → live deployment | 🚧 Feature-limited at ~0.55 AUC |
+| Feature stack v1 (batter/pitcher/context/matchup) | ✅ 112 features, 4 modules, leak-safe |
+| Statcast pitch-extras backfill (spray, bat tracking, catcher, arm angle) 2019–2026 | ✅ `scrapers/mlb/backfill_pitch_extras.py` (5M pitches) |
+| v6 feature stack: + spray/pull, bat-tracking, framing, luck-gap (full coverage) | ✅ 123 features; accepted via batch gates (see `leg1_*_gate.py`) |
+| Blend beats market line (residual gate, both time directions) | ✅ TB +0.009/+0.017, HR +0.004/+0.014 AUC |
+| Standalone vs vig (90d walk-forward blend, side-balanced) | ✅ Backtest positive both years at ev>2% — pending live confirmation |
+| Filter/veto role (improves Leg 2 bet selection) | ✅ Validated both years, 3 model versions |
+| Forward tracker (daily scoring, `v3_signals`) | ✅ `models/mlb/v3_tracker.py` on daily cron |
+| Rejected honestly: embeddings (×2), swing deltas, swing-path batch | 📕 Gates in repo; BvP chemistry = noise |
 
 **Leg 2 — +EV line-shopping (sharp-vs-soft)**
 
@@ -423,17 +426,21 @@ and leg 2 (live Novig directly, zero approximation error) is what actually clear
 
 ## What's next
 
-1. **Accumulate paper-trade results** (running automatically) — the decisive
-   tradeable-edge test; revisit after ~weeks of settled bets, segmenting by edge
-   size, liquidity, and discrepancy persistence.
-2. **Close the feature gap (legs 1 & 3)** — both own-models plateau at ~0.55 AUC vs
-   Novig's ~0.57, and we proved the bottleneck is *features*, not the training target.
-   Pitcher pitch-shape + batter swing embeddings are the path to matching Novig — which
-   would make the owned model bettable on its own (and on books Novig doesn't cover).
-3. **Combine the legs** — blended fair value (Novig + distill + model), or use the
-   model/archetype priors (e.g. K-suppression) to confirm line-shopping bets.
-4. **Underdog-only markets** (v2): once we have ~60 days of forward capture, model
-   the batter-walks market (Underdog offers it, sharp books barely price it).
+1. **Forward-validate the standalone candidate** (running automatically) — "v6 +
+   90-day walk-forward blend, ev>4%" passed the vig in backtest both years;
+   `v3_tracker report` accumulates the live verdict daily. No real money until it
+   confirms (~4 weeks).
+2. **Pitcher-K market gate** — point the Poisson K model (1.83 MAE, full
+   distribution → handles varying lines natively) at BettingPros market 285
+   (3 seasons of Underdog K props, 3.4K Novig). The K-suppression mechanism is the
+   market's most-confirmed soft spot.
+3. **Venue portfolio (Leg 2)** — DK RBI singles (+8.5%, positive 3/3 months, n=243)
+   to forward tracking; Fliff (book 39) sweep when backfill lands; shade-corrected
+   fair values (books load vig onto overs: measured 0.5–2.5pts, 13/13 cells) into
+   paper-trade EVs.
+4. **Let data compound** — bat-tracking coverage grows monthly (v6 proved coverage
+   is the multiplier: same features at 6× history doubled the edge); monthly
+   retrains harvest it with no new code.
 
 ## Lessons from the totals work (preserved in `archive/`)
 
