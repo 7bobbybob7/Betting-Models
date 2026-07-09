@@ -165,23 +165,24 @@ Hitter props on Underdog have three advantages over game totals:
 │
 ├── models/
 │   └── mlb/
-│       │  # Strategy 1 — own predictive model
-│       ├── batter_arsenal_features.py    — 36 batter features (per pitch type + buckets)
-│       ├── pitcher_arsenal_features.py   — 45 pitcher features (mix conditioned on batter hand)
-│       ├── context_features.py           — 11 context features (rolling 365D park factors,
-│       │                                   weather, lineup OBP-in-front, SLG-behind)
-│       ├── matchup_features.py           — 6 cross-features (handedness-aware weighted xwOBA)
-│       ├── hitter_prop_dataset.py        — Assembler: 112 features + HRR/TB/RBI labels
-│       │  # Leg 1 — own model (trained on outcomes)
-│       ├── hitter_prop_model.py          — Train LR-L1 + XGBoost, isotonic calibration, CV
-│       ├── backtest.py                   — Model EV sweep vs Underdog odds
-│       ├── cache/                        — Cached feature parquets (train / backtest splits)
-│       │  # Leg 2 — +EV line-shopping
-│       ├── line_shopping.py              — Novig-vs-Underdog discrepancy backtest (sharp-vs-soft)
-│       ├── paper_trade.py                — Forward paper-trade: log pre-game +EV / settle / report
-│       │  # Leg 3 — distillation (trained on Novig's price)
-│       └── distill_model.py              — Distill Novig fair price into our own model (+ walk-forward CV)
-│                                            (totals-era models live in archive/models/mlb/)
+│       ├── feature_sets.py   — SINGLE SOURCE OF TRUTH: accepted feature lists
+│       │                       (ADV_FEATS/BATCH1/LUCK), caches, params, build_luck().
+│       │                       Research batches that pass their gate get PROMOTED here.
+│       ├── features/         — feature builders (batter/pitcher arsenal, context, matchup,
+│       │                       game-context, advanced-profile: spray/bat-tracking/framing)
+│       ├── hitter/           — Leg 1 + Leg 3 production: hitter_prop_dataset (assembler),
+│       │                       hitter_prop_model (base bundles), train_v3 (current v6 bundle),
+│       │                       v3_tracker (daily forward scoring -> v3_signals, cron),
+│       │                       backtest (odds attach + EV), distill_model
+│       ├── trading/          — Leg 2 execution: line_shopping (sharp-vs-soft backtest),
+│       │                       paper_trade (log pre-game +EV / settle / report, cron)
+│       ├── pitcher/          — pitcher-prop lane (k_gate: market 285 — rejected; flagship
+│       │                       K market is sharp)
+│       ├── research/         — one-shot gates/audits/backtests, frozen once run
+│       │                       (leg1_* attacks, batch gates, embeddings, audits, sims)
+│       ├── cache/            — cached feature parquets (train/backtest splits, adv profiles)
+│       └── saved/            — model bundles (gitignored)
+│                                (totals-era models live in archive/models/mlb/)
 │
 ├── scripts/
 │   └── daily_refresh.py      — Morning cron entry point

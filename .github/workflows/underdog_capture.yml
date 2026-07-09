@@ -50,4 +50,4 @@ jobs:
         if: always()
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
-        run: python -m models.mlb.paper_trade log
+        run: python -m models.mlb.trading.paper_trade log
