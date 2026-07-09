@@ -58,12 +58,15 @@ jobs:
       # Pull prop lines + results from BettingPros (Underdog 36 + Novig 60). Was never
       # cronned before 2026-07 — data silently stopped at the last manual backfill.
       # Trailing 3 days so late-scored actuals get refreshed.
+      # Pull default books (Underdog 36, Novig 60, Consensus 0) + DraftKings 12 (for the
+      # DK-RBI singles tracker). Trailing 3 days so late-scored actuals refresh.
       - name: Pull BettingPros props (trailing 3 days)
         if: always()
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: |
           python -m scrapers.props.bettingpros --start "$(date -u -d '3 days ago' +%F)" --end "$(date -u +%F)"
+          python -m scrapers.props.bettingpros --start "$(date -u -d '3 days ago' +%F)" --end "$(date -u +%F)" --books 12
 
       # Score yesterday's TB props with the v3 model (Attack 3 winner) — retrospective,
       # leak-safe by construction; accumulates forward OOS evidence in v3_signals.
@@ -73,3 +76,10 @@ jobs:
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: python -m models.mlb.hitter.v3_tracker log --days 2
+
+      # Forward-track the venue-sweep survivor: DK RBI 0.5 singles vs Novig fair.
+      - name: Log DK RBI singles signals
+        if: always()
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python -m models.mlb.trading.dk_rbi_tracker log --days 3
