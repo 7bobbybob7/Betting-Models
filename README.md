@@ -15,8 +15,10 @@ only in *where the "true" probability comes from*:
 
 1. **Own predictive model** (`models/mlb/hitter_prop_model.py`) — build `P_true`
    ourselves from matchup-aware features by training on game *outcomes*. Hardest
-   path: it requires out-forecasting the market. Currently feature-limited
-   (AUC ~0.55 vs the market's ~0.57); in active development.
+   path: it requires out-forecasting the market. After the v3→v7 campaign (spray/
+   bat-tracking/luck-gap batches, all gate-verified) the blend beats the market
+   line on TB + HR and the walk-forward backtest clears the vig — now in live
+   forward validation.
 
 2. **+EV line-shopping / sharp-vs-soft** (`models/mlb/line_shopping.py`) — let a
    **sharp book be the model**. Take Novig's de-vigged exchange price as fair
@@ -81,17 +83,23 @@ Hitter props on Underdog have three advantages over game totals:
 | Blend beats market line (residual gate, both time directions) | ✅ TB +0.009/+0.017, HR +0.004/+0.014 AUC |
 | Standalone vs vig (90d walk-forward blend, side-balanced) | ✅ Backtest positive both years at ev>2% — pending live confirmation |
 | Filter/veto role (improves Leg 2 bet selection) | ✅ Validated both years, 3 model versions |
-| Forward tracker (daily scoring, `v3_signals`) | ✅ `models/mlb/v3_tracker.py` on daily cron |
-| Rejected honestly: embeddings (×2), swing deltas, swing-path batch | 📕 Gates in repo; BvP chemistry = noise |
+| Forward tracker (daily scoring, `v3_signals`) | ✅ `models/mlb/hitter/v3_tracker.py` on daily cron |
+| **v7 production retrain** (thru 2026-04; +63K bat-tracking-rich rows; July+ stays OOS) | ✅ `hitter/train_production.py` — TB + first HR bundle |
+| Pitcher lane: K market | 📕 SHARP (market 0.58 vs model 0.54) — model can't win there |
+| Pitcher lane: OUTS model (decision-family: leash/bullpen/workload + line-conditional) | 🚧 0.52→0.556 in 2 batches; at blend boundary; frozen pending DK-outs venue confirmation |
+| Rejected honestly: embeddings (×2), swing deltas, swing-path, line-conditional-for-TB, K-modern | 📕 Gates frozen in `research/` + `pitcher/` |
 
 **Leg 2 — +EV line-shopping (sharp-vs-soft)**
 
 | Component | Status |
 |-----------|--------|
-| Novig vs Underdog discrepancy backtest | ✅ `models/mlb/line_shopping.py` — shows potential edge |
+| Novig vs Underdog discrepancy backtest | ✅ `models/mlb/trading/line_shopping.py` |
 | Live dual-book capture (Novig + Underdog, aligned ticks) | ✅ Running |
-| Forward paper-trade harness (pre-game filter, settle, ROI) | ✅ `models/mlb/paper_trade.py` — logging live |
-| Live betting | ⏸️ Pending forward validation (~weeks of settled bets) |
+| Forward paper-trade harness (pre-game filter, settle, ROI) | ✅ `trading/paper_trade.py` — logging live |
+| Venue sweep (DK/Caesars/Fanatics/BetMGM/Fliff × all prop markets vs Novig) | ✅ Complete — sole survivors: **DK RBI/RUNS/OUTS singles** (+8.5/+10.1/+14.8% backfill, month-consistent) |
+| Fliff verdict | 📕 Vig-walled (11.5% overround); EV signal uncorrelated with outcomes at ANY threshold (DK positive control confirms method) |
+| DK 3-market forward tracker + today's board (`show`) | ✅ `trading/dk_rbi_tracker.py` on daily cron; forward record from 2026-07-09 |
+| Live betting | ⏸️ Pending forward validation (~4-6 weeks of settled bets) |
 
 **Leg 3 — distillation model (trained on Novig's price)**
 
@@ -171,7 +179,7 @@ Hitter props on Underdog have three advantages over game totals:
 │       ├── features/         — feature builders (batter/pitcher arsenal, context, matchup,
 │       │                       game-context, advanced-profile: spray/bat-tracking/framing)
 │       ├── hitter/           — Leg 1 + Leg 3 production: hitter_prop_dataset (assembler),
-│       │                       hitter_prop_model (base bundles), train_v3 (current v6 bundle),
+│       │                       hitter_prop_model (base bundles), train_v3 (research), train_production (v7 live bundle),
 │       │                       v3_tracker (daily forward scoring -> v3_signals, cron),
 │       │                       backtest (odds attach + EV), distill_model
 │       ├── trading/          — Leg 2 execution: line_shopping (sharp-vs-soft backtest),
@@ -425,23 +433,24 @@ between losing to the vig and beating it) is a richer-features problem: pitcher
 pitch-shape + batter swing embeddings. Until then, leg 3 is the owned fallback/monitor,
 and leg 2 (live Novig directly, zero approximation error) is what actually clears the vig.
 
-## What's next
+## What's next — the WAITING phase (all clocks run themselves)
 
-1. **Forward-validate the standalone candidate** (running automatically) — "v6 +
-   90-day walk-forward blend, ev>4%" passed the vig in backtest both years;
-   `v3_tracker report` accumulates the live verdict daily. No real money until it
-   confirms (~4 weeks).
-2. **Pitcher-K market gate** — point the Poisson K model (1.83 MAE, full
-   distribution → handles varying lines natively) at BettingPros market 285
-   (3 seasons of Underdog K props, 3.4K Novig). The K-suppression mechanism is the
-   market's most-confirmed soft spot.
-3. **Venue portfolio (Leg 2)** — DK RBI singles (+8.5%, positive 3/3 months, n=243)
-   to forward tracking; Fliff (book 39) sweep when backfill lands; shade-corrected
-   fair values (books load vig onto overs: measured 0.5–2.5pts, 13/13 cells) into
-   paper-trade EVs.
-4. **Let data compound** — bat-tracking coverage grows monthly (v6 proved coverage
-   is the multiplier: same features at 6× history doubled the edge); monthly
-   retrains harvest it with no new code.
+Research is complete: every venue swept, every market gated, every model iterated to
+its current data ceiling. Four forward records accumulate daily via cron; they — not
+more backtests — decide what becomes real money (~4-6 weeks):
+
+1. **v7 TB standalone candidate** — walk-forward blend cleared vig in backtest both
+   years; `hitter/v3_tracker report` shows the live verdict (clean OOS from 2026-07).
+2. **DK singles portfolio** — RBI/RUNS/OUTS vs Novig fair; `trading/dk_rbi_tracker
+   report` (forward from 2026-07-09); `... show` prints today's bettable board.
+3. **Underdog paper-trade** + v7 veto agreement split (the filter role, validated 3×).
+4. **Outs model unfreeze trigger** — if the DK-outs venue edge confirms live, the
+   frozen outs model (0.556, at blend boundary) becomes a pick-ranker within it.
+
+Scheduled (not blocked on the above): **monthly production retrain**
+(`hitter/train_production.py`) — bat-tracking coverage compounds with zero new code
+(v6 proved coverage is the multiplier). Small queue: wire HR forward tracking to the
+new HR bundle; glance at GitHub Actions after the next cron for the reorg'd paths.
 
 ## Lessons from the totals work (preserved in `archive/`)
 
