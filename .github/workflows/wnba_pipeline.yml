@@ -1,0 +1,43 @@
+name: Daily WNBA Refresh
+
+# WNBA data + signal tracking, isolated from the MLB pipeline so either sport's
+# failure leaves the other running. Season: May-Oct.
+
+on:
+  schedule:
+    # 10:30 UTC = 6:30 AM ET (offset from MLB's 10:00 to spread load)
+    - cron: '30 10 * * *'
+  workflow_dispatch:
+
+jobs:
+  wnba-refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+      - run: pip install -r requirements.txt
+
+      - name: WNBA games + player box scores
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python scrapers/wnba/games.py --start 2026 --end 2026
+
+      # Anchors (Novig 60, ProphetX 38, Consensus 0) + pick'ems (UD 36, Sleeper 63).
+      # Retail books retroactively backfillable from BettingPros if ever needed.
+      - name: Pull BettingPros WNBA props (trailing 3 days)
+        if: always()
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          python -m scrapers.props.bettingpros --sport WNBA --force --start "$(date -u -d '3 days ago' +%F)" --end "$(date -u +%F)" --books 0,60,36,63,38
+
+      # Structural candidate: blanket unders at Novig (threes/assists/points).
+      - name: Log WNBA Novig-unders signals
+        if: always()
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python -m models.wnba.novig_unders_tracker log --days 3

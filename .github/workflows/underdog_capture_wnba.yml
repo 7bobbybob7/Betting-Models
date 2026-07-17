@@ -1,0 +1,35 @@
+name: Underdog/Novig WNBA Capture
+
+# Live WNBA line snapshots (Underdog + Novig), the twin of underdog_capture_mlb.
+# These per-tick snapshots ARE the intraday line record: CLV = frozen morning
+# BettingPros line (entry) vs last pre-game snapshot here (closing). BettingPros
+# runs only in the WNBA daily refresh (wnba_pipeline.yml), mirroring MLB.
+# WNBA tip-offs ~7-10pm ET -> ticks at 11am/2pm/5pm/7pm ET.
+
+on:
+  schedule:
+    - cron: '0 15,18,21,23 * * *'
+  workflow_dispatch:
+
+jobs:
+  wnba-capture:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+      - run: pip install -r requirements.txt
+
+      - name: Capture Underdog WNBA
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python -m scrapers.props.underdog --sport WNBA
+
+      - name: Capture Novig WNBA
+        if: always()
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python -m scrapers.props.novig --league WNBA

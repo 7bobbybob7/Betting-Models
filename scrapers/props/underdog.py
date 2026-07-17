@@ -38,11 +38,11 @@ def fetch_lines():
     return r.json()
 
 
-def extract_mlb_props(data, snapshot_ts):
+def extract_mlb_props(data, snapshot_ts, sport="MLB"):
     games = {g["id"]: g for g in data.get("games", [])}
     players = {p["id"]: p for p in data.get("players", [])}
 
-    mlb_game_ids = {g["id"] for g in data.get("games", []) if g.get("sport_id") == "MLB"}
+    mlb_game_ids = {g["id"] for g in data.get("games", []) if g.get("sport_id") == sport}
 
     mlb_app = {}
     for app in data.get("appearances", []):
@@ -84,6 +84,7 @@ def extract_mlb_props(data, snapshot_ts):
             "player_team_id": ctx["team_id"],
             "player_jersey": player.get("jersey_number"),
             "underdog_game_id": ctx["game_id"],
+            "scheduled_start": game.get("scheduled_at"),
             "game_title": game.get("full_team_names_title"),
             "home_team_id": game.get("home_team_id"),
             "away_team_id": game.get("away_team_id"),
@@ -129,7 +130,7 @@ DB_COLUMNS = [
     "stat_value", "stat_type", "stat_internal", "category", "has_alternates",
     "underdog_player_id", "player_first_name", "player_last_name",
     "player_position", "player_team_id", "player_jersey",
-    "underdog_game_id", "game_title", "home_team_id", "away_team_id",
+    "underdog_game_id", "scheduled_start", "game_title", "home_team_id", "away_team_id",
     "match_progress",
     "choice", "choice_display", "american_price", "decimal_price",
     "payout_multiplier", "option_status",
@@ -179,6 +180,7 @@ def write_to_csv(rows, output_dir):
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--sport", default="MLB")
     parser.add_argument("--csv-only", action="store_true",
                         help="Skip DB write, only output CSV")
     parser.add_argument("--csv-also", action="store_true",
@@ -193,7 +195,7 @@ def main():
     total_lines = len(data.get("over_under_lines", []))
     print(f"  {total_lines} total lines across all sports")
 
-    rows = extract_mlb_props(data, snapshot_ts)
+    rows = extract_mlb_props(data, snapshot_ts, sport=args.sport)
     print(f"  {len(rows)} MLB prop rows (lines x sides)")
 
     if not rows:

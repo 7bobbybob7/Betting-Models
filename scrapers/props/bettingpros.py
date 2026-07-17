@@ -91,13 +91,13 @@ INSERT_COLS = [
 ]
 
 
-def fetch_props_for_date_book(prop_date, book_id, sleep_between_pages=0.15, max_retries=4):
+def fetch_props_for_date_book(prop_date, book_id, sleep_between_pages=0.15, max_retries=4, sport="MLB"):
     """Pull all pages of props for a (date, book_id) combination, retrying transient errors."""
     rows = []
     page = 1
     while page < 50:  # safety upper bound
         params = {
-            "sport": "MLB",
+            "sport": sport,
             "date": prop_date,
             "book_id": book_id,
             "ev_threshold": "false",
@@ -201,7 +201,12 @@ def insert_rows(rows, max_retries=3):
     sql = (
         f"INSERT INTO bettingpros_props ({cols}) "
         f"VALUES ({placeholders}) "
-        f"ON CONFLICT (prop_date, market_id, book_id, bp_player_id) DO NOTHING"
+        f"ON CONFLICT (prop_date, market_id, book_id, bp_player_id) DO UPDATE "
+        f"SET actual = EXCLUDED.actual, is_scored = EXCLUDED.is_scored, "
+        f"is_push = EXCLUDED.is_push, "
+        f"closing_over_odds = EXCLUDED.over_odds, "
+        f"closing_under_odds = EXCLUDED.under_odds, "
+        f"closing_line = EXCLUDED.over_line"
     )
     for attempt in range(max_retries):
         try:
@@ -220,7 +225,7 @@ def insert_rows(rows, max_retries=3):
             time.sleep(wait)
 
 
-def pull_date(prop_date, book_ids, sleep_between_books=0.3, skip_existing=True):
+def pull_date(prop_date, book_ids, sleep_between_books=0.3, skip_existing=True, sport="MLB"):
     """Pull a single date for all requested books.
     Per-book failures are logged but don't abort the rest of the backfill."""
     total_inserted = 0
@@ -231,7 +236,7 @@ def pull_date(prop_date, book_ids, sleep_between_books=0.3, skip_existing=True):
             print(f"  {prop_date} | {book_name:12s} (id={book_id}): already loaded, skipping")
             continue
         try:
-            raw = fetch_props_for_date_book(str(prop_date), book_id)
+            raw = fetch_props_for_date_book(str(prop_date), book_id, sport=sport)
             if not raw:
                 print(f"  {prop_date} | {book_name:12s} (id={book_id}): no props")
                 continue
@@ -264,6 +269,10 @@ def main():
                         help="End date for backfill (inclusive, YYYY-MM-DD). Defaults to today.")
     parser.add_argument("--books", type=str, default=None,
                         help="Comma-separated book IDs (default: Underdog, Consensus, Novig)")
+    parser.add_argument("--force", action="store_true",
+                        help="Bypass skip-existing (needed for WNBA over dates MLB already covers)")
+    parser.add_argument("--sport", type=str, default="MLB",
+                        help="Sport (MLB, WNBA, ...) — WNBA market_ids 390-398 don't collide with MLB")
     args = parser.parse_args()
 
     if args.books:
@@ -289,7 +298,7 @@ def main():
     grand_inserted = 0
     grand_fetched = 0
     for d in dates:
-        ins, fetched = pull_date(d, book_ids)
+        ins, fetched = pull_date(d, book_ids, sport=args.sport, skip_existing=not args.force)
         grand_inserted += ins
         grand_fetched += fetched
 

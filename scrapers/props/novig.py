@@ -43,6 +43,8 @@ HEADERS = {
 ET = ZoneInfo("America/New_York")
 
 # Hitter markets we care about (incl. softer ones that showed line-shopping edge)
+WNBA_TYPES = ['POINTS', 'REBOUNDS', 'ASSISTS', 'THREE_POINTERS_MADE',
+              'POINTS_REBOUNDS_ASSISTS', 'REBOUNDS_ASSISTS']
 MARKET_TYPES = [
     "HITS_RUNS_RBIS", "TOTAL_BASES", "RBIS", "RUNS", "HITS",
     "HOME_RUNS", "BATTING_WALKS", "STOLEN_BASES", "TOTAL_BASES",
@@ -50,10 +52,10 @@ MARKET_TYPES = [
 PAGE = 200  # markets per GraphQL page
 
 QUERY = """
-query Markets($types: [String!], $limit: Int!, $offset: Int!) {
+query Markets($types: [String!], $limit: Int!, $offset: Int!, $league: String!) {
   market(
     where: {
-      league: {_eq: "MLB"},
+      league: {_eq: $league},
       type: {_in: $types},
       status: {_eq: "OPEN"},
       playerId: {_is_null: false},
@@ -91,13 +93,13 @@ def _post(payload, max_retries=3):
             time.sleep(wait)
 
 
-def fetch_markets():
+def fetch_markets(league="MLB"):
     """Page through all upcoming OPEN MLB hitter-prop markets."""
     out, offset = [], 0
-    types = sorted(set(MARKET_TYPES))
+    types = sorted(set(WNBA_TYPES if league == "WNBA" else MARKET_TYPES))
     while offset < 20000:  # safety bound
         data = _post({"query": QUERY,
-                      "variables": {"types": types, "limit": PAGE, "offset": offset}})
+                      "variables": {"league": league, "types": types, "limit": PAGE, "offset": offset}})
         batch = data.get("market", [])
         out.extend(batch)
         if len(batch) < PAGE:
@@ -174,11 +176,12 @@ def insert_rows(rows, max_retries=3):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--dry-run", action="store_true", help="Print summary, no DB write")
+    parser.add_argument("--league", default="MLB")
     args = parser.parse_args()
 
     captured_at = datetime.now(timezone.utc)
     print(f"Novig capture @ {captured_at.isoformat()}")
-    markets = fetch_markets()
+    markets = fetch_markets(league=args.league)
     print(f"Fetched {len(markets):,} upcoming OPEN MLB hitter-prop markets")
 
     rows = [flatten(m, captured_at) for m in markets if m.get("id")]

@@ -51,3 +51,4 @@ jobs:
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: python -m models.mlb.trading.paper_trade log
+
