@@ -15,3 +15,5 @@ CLAUDE.md
 SESSION_SUMMARY.md
 PRD.md
 PROJECT_OVERVIEW.md
+models/wnba/saved/*.pkl
+models/wnba/cache/
