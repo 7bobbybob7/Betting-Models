@@ -1,10 +1,11 @@
-# MLB Player Prop Betting Platform
+# Multi-Sport Player Prop Betting Platform (MLB + WNBA)
 
-A data + modeling pipeline for **MLB player prop betting** (Hits + Runs + RBIs,
-Total Bases, Hits, etc.) targeting Underdog Fantasy's adjusted-odds market.
+A data + modeling pipeline for **player prop betting** — MLB (Hits + Runs + RBIs,
+Total Bases, HR, …) and WNBA (points, rebounds, assists, threes) — against
+Underdog, Novig, DraftKings and other books.
 
-Pulls Statcast pitch data, MLB box scores, and prop lines from multiple books
-into Postgres on a daily schedule. All three legs below ultimately produce the
+Pulls Statcast pitch data, MLB/WNBA box scores, play-by-play, and prop lines from
+14+ books into Postgres on per-sport daily + intraday cron schedules. All three legs below ultimately produce the
 same thing — a **`P_true` estimate** that, when it beats the price Underdog
 offers, makes a **positive-EV bet**.
 
@@ -108,6 +109,20 @@ Hitter props on Underdog have three advantages over game totals:
 | Distill features → Novig de-vigged price | ✅ `models/mlb/distill_model.py` |
 | Walk-forward CV (monthly, embargoed) | ✅ stable ~0.55 AUC, reproduces Novig (MAE ~0.027) |
 | Close feature gap so distilled model clears the vig | 🚧 Feature-limited (same ceiling as leg 1) |
+
+**WNBA (second sport — full campaign July 2026)**
+
+| Component | Status |
+|-----------|--------|
+| Prop odds backfill (14 books, 2025-05→now, all scored) | ✅ 143K props via multi-sport BettingPros scraper |
+| Anchor referee (who forecasts outcomes best?) | ✅ Novig best-but-barely; book disagreements = COIN FLIP (50.9%) → **no sharp-vs-soft edge in WNBA** |
+| Structural trade: universal ~3pt over-shade > exchange vig only | ✅ **Novig blanket unders** (threes/assists/points, +2.6% / +3.4% best-price-routed) — tracked (`wnba_unders_signals`) |
+| Venue verdicts | 📕 Retail vig (7%) eats the shade; Sleeper/PrizePicks vig-walled (12-15%) |
+| Points model: minutes/rotation family (v2 gate) | ✅ **ACCEPTED** — beats mkt both directions |
+| Points model: realized player-vs-TEAM H2H (batch-6; 13-team density defeats MLB's sparsity) | ✅ **ACCEPTED** — balanced +0.005/+0.006 over mkt → `wnba_points_lc.pkl` (wnba-v3), model-ranks the unders |
+| Rejected honestly: v1 box-score, shot-profiles+fingerprint, opp-matchup, combos, PBP tendencies, b4+b5 stack | 📕 Gates in `models/wnba/`; rebounds ended −0.002 from the sharpest WNBA line |
+| Data banked | ✅ 95K shot charts, 556 ESPN fingerprint player-seasons (unlocked via S3 pattern), 620K PBP events (shufinskiy/nba_data) |
+| Next lead | 🚧 Live lineup/injury feed (real-time info — the only untapped category) |
 
 ## Architecture
 
@@ -446,6 +461,10 @@ more backtests — decide what becomes real money (~4-6 weeks):
 3. **Underdog paper-trade** + v7 veto agreement split (the filter role, validated 3×).
 4. **Outs model unfreeze trigger** — if the DK-outs venue edge confirms live, the
    frozen outs model (0.556, at blend boundary) becomes a pick-ranker within it.
+5. **WNBA Novig-unders** (threes/assists/points) + **wnba-v3 model-ranked points slice**
+   — `models.wnba.novig_unders_tracker report` (forward from 2026-07-12).
+6. **WNBA lineup/injury feed** — the one remaining build: real-time starters/out-lists
+   sharpen both accepted families (minutes + H2H); free via ESPN/WNBA reports.
 
 Scheduled (not blocked on the above): **monthly production retrain**
 (`hitter/train_production.py`) — bat-tracking coverage compounds with zero new code
