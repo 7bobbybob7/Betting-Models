@@ -17,3 +17,6 @@ PRD.md
 PROJECT_OVERVIEW.md
 models/wnba/saved/*.pkl
 models/wnba/cache/
+# production bundles ARE tracked (CI trackers need them); research pkls stay ignored
+!models/mlb/saved/hitter_tb_xgb_v3.pkl
+!models/wnba/saved/wnba_points_lc.pkl
