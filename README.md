@@ -60,6 +60,10 @@ Hitter props on Underdog have three advantages over game totals:
    pitcher arsenals is more model-tractable than game totals which are
    already a sum of many noisy components.
 
+**Full experimental record:** every hypothesis, gate, verdict, and incident is logged in
+[docs/RESEARCH_LOG.md](docs/RESEARCH_LOG.md) — the methodology preamble there defines the
+acceptance bars all results in this README passed through.
+
 ## Project status
 
 **Data layer**
