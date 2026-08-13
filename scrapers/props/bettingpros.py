@@ -49,7 +49,11 @@ HEADERS = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
     "Accept": "application/json",
     "Referer": "https://www.bettingpros.com/",
+    # BP began requiring their public frontend key ~2026-08-07 (403s without it, which
+    # this scraper previously swallowed as "no props" -> 6 silent dark days)
+    "x-api-key": "CHi8Hy5CEE4khd46XNYL23dCFX96oUdw6qOt1Dnh",
 }
+HTTP_FAILURES = 0
 
 # Default books to pull (book_id → readable name)
 DEFAULT_BOOKS = {
@@ -113,6 +117,7 @@ def fetch_props_for_date_book(prop_date, book_id, sleep_between_pages=0.15, max_
             except requests.RequestException as e:
                 wait = 2 ** (attempt + 1)
                 if attempt == max_retries - 1:
+                    globals()['HTTP_FAILURES'] = globals().get('HTTP_FAILURES', 0) + 1
                     print(f"    Request error on page {page} after {max_retries} retries: {e}")
                     return rows
                 print(f"    Page {page} attempt {attempt + 1}/{max_retries} failed ({type(e).__name__}); sleeping {wait}s")
@@ -304,6 +309,9 @@ def main():
 
     print()
     print(f"=== TOTAL: fetched {grand_fetched:,} props, inserted {grand_inserted:,} new rows ===")
+    if grand_fetched == 0 and HTTP_FAILURES > 0:
+        print(f"FATAL: 0 props fetched with {HTTP_FAILURES} HTTP failures — auth/API break? Exiting 1 so cron goes RED.")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

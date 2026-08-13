@@ -162,6 +162,9 @@ def main():
         end = date.today() - timedelta(days=1)
         start = end - timedelta(days=args.days - 1)
         df = _score_range(start, end)
+        if df.empty:
+            print(f"no DK/Novig rows in {start}..{end} — upstream data gap? nothing to log")
+            report(); return
         df = df[pd.to_datetime(df['prop_date']).dt.date >= FORWARD_START]
         print(f"forward: {_upsert(df, backfill=False):,} signals logged/settled "
               f"({start}..{end})")

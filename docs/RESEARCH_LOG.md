@@ -72,6 +72,8 @@ are promoted to `feature_sets.py` (MLB) or bundles; gate scripts stay frozen in
 - **BettingPros never cronned** (data silently frozen at last manual pull) → daily cron + `--force`.
 - **ON CONFLICT DO NOTHING froze settlements** → settlement-fields-only upsert; first-seen odds preserved (CLV entry), `closing_*` updated by later pulls; `scheduled_start` on all snapshot tables + execution-time stamps = delay-proof CLV.
 - **Production bundles gitignored → CI trackers failed 19 straight days** (July 9-27, works-on-my-machine) → track production pkls; v3_signals gap repaired retrospectively (1,233 signals).
+- **BettingPros began requiring their public frontend `x-api-key` (~Aug 7) → 403s on every pull, but the scraper swallowed them as "no props" and exited 0 → 6 silent dark days** (Aug 7-12, both sports, all books; only surfaced because the DK tracker crashed on the empty window). Fix: key added to HEADERS; 0-props-fetched + HTTP failures now exits 1 (loud red cron, never silent green); tracker got an empty-window guard; gap backfilled with `--force` and trackers re-run.
+- **Same week, independently: ESPN started throttling GitHub runner IPs → WNBA games.py's full-season rescan (184 scoreboard calls) hung → job cancelled at the 25-min timeout 6 days straight (Aug 7-12), killing the downstream BettingPros + tracker steps too** — cancelled ≠ failed, so no red X pattern-matched. Game logs froze at Aug 4 → every points-unders row since scored without p_model. Fix: `--days` incremental mode (trailing-window scoreboard scan, `--days 7` in cron); logs backfilled locally, ranks repaired back through July.
 - models/mlb reorg: `feature_sets.py` single source of truth; production never imports research.
 
 ## Circadian / travel investigation (2026-07-28)

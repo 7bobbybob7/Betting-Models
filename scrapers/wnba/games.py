@@ -112,11 +112,16 @@ def fetch_json(url, retries=3):
     return None
 
 
-def get_season_games(year):
-    """Get all game event IDs for a WNBA season."""
+def get_season_games(year, days=None):
+    """Get game event IDs for a WNBA season. With `days`, scan only the trailing
+    window (cron mode) — a full-season rescan is 184 scoreboard calls, which ESPN
+    throttles from GitHub runner IPs (hangs began 2026-08-07, 25-min timeout)."""
     # WNBA runs May-October
     start = date(year, 5, 1)
     end = date(year, 10, 31)
+    if days is not None:
+        start = max(start, date.today() - timedelta(days=days))
+        end = min(end, date.today())
 
     event_ids = []
     current = start
@@ -365,6 +370,8 @@ def main():
     parser = argparse.ArgumentParser(description="Pull WNBA data from ESPN")
     parser.add_argument("--start", type=int, default=2020)
     parser.add_argument("--end", type=int, default=2025)
+    parser.add_argument("--days", type=int, default=None,
+                        help="Only scan the trailing N days of scoreboards (incremental cron mode)")
     args = parser.parse_args()
 
     print(f"\n{'='*60}")
@@ -380,7 +387,7 @@ def main():
 
         # Get all event IDs for the season
         print(f"  Fetching schedule...")
-        event_ids = get_season_games(year)
+        event_ids = get_season_games(year, days=args.days)
         print(f"  Found {len(event_ids)} games")
 
         if not event_ids:

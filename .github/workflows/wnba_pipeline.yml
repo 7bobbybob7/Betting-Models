@@ -21,10 +21,13 @@ jobs:
           cache: 'pip'
       - run: pip install -r requirements.txt
 
+      # --days 7: incremental trailing window. Full-season rescan = 184 scoreboard
+      # calls, which ESPN throttles from GitHub runner IPs (hung + cancelled at the
+      # 25-min timeout every day 2026-08-07..12, taking the whole job down with it).
       - name: WNBA games + player box scores
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
-        run: python scrapers/wnba/games.py --start 2026 --end 2026
+        run: python scrapers/wnba/games.py --start 2026 --end 2026 --days 7
 
       # Anchors (Novig 60, ProphetX 38, Consensus 0) + pick'ems (UD 36, Sleeper 63).
       # Retail books retroactively backfillable from BettingPros if ever needed.
